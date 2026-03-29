@@ -2,6 +2,10 @@
 获取正股信息
 从AKShare获取正股行业分类和主营业务
 """
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import akshare as ak
 import pandas as pd
 from datetime import datetime

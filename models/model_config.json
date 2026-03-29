@@ -1,0 +1,38 @@
+{
+  "mae_ensemble": 7.548635104889261,
+  "r2_ensemble": 0.24779873980135736,
+  "ensemble_weights": [
+    0.38023867822155794,
+    0.2887065216278071,
+    0.331054800150635
+  ],
+  "train_size": 284,
+  "val_size": 72,
+  "n_features": 24,
+  "feature_names": [
+    "cb_count",
+    "cb_market_avg",
+    "conversion_value",
+    "coupon_rate",
+    "cv_to_issue",
+    "debt_ratio",
+    "duration_adj",
+    "gross_margin",
+    "high_premium",
+    "industry_heat",
+    "issue_size",
+    "market_score",
+    "pe_real",
+    "premium_rate",
+    "profit_growth",
+    "rating_score",
+    "revenue_growth",
+    "size_factor",
+    "stock_listing_days",
+    "stock_market_cap",
+    "stock_pb",
+    "stock_pe",
+    "stock_roe",
+    "years_to_expiry"
+  ]
+}

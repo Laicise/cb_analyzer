@@ -12,10 +12,9 @@ from scripts.fetch_cov_data import update_all as fetch_cov
 from scripts.fetch_stock_info import fetch_all_stock_info
 from scripts.fetch_stock_fundamentals import fetch_all_stock_fundamentals, update_missing_stock_info
 from scripts.calculate_yield import update_yields
-from scripts.continue_fetch import batch_fetch_history
+from scripts.continue_fetch import continue_fetch_history
 from analysis.similarity import find_similar_bonds, get_confidence_level
-from analysis.ml_model_v2 import train_ensemble, predict_price_ml, evaluate_on_history
-from analysis.ml_model_v3 import train_v3, predict_price_ml_v3
+from analysis.ml_model_v5 import train_ensemble_v5, predict_price_v5
 from config import RATING_MAP
 from datetime import datetime
 import warnings
@@ -139,15 +138,17 @@ def predict_bond(bond_code, method='all'):
     # 2. ML模型预测
     if method in ['all', 'ml']:
         print(f"\n{'='*70}")
-        print(f"【方法2: 机器学习模型】")
+        print(f"【方法2: 机器学习模型 v5】")
         print(f"{'='*70}")
         
-        ml_result = predict_price_ml(bond_code)
+        ml_result = predict_price_v5(bond_code)
         if ml_result:
             results['ml'] = ml_result['predicted_price']
             print(f"  预测价格: {ml_result['predicted_price']}元")
-            print(f"  价格区间: {ml_result['price_range'][0]:.2f} ~ {ml_result['price_range'][1]:.2f}元")
-            print(f"  模型MAE: {ml_result['mae']:.2f}元")
+            print(f"  ├─ 线性回归: {ml_result.get('lr', 'N/A')}元")
+            print(f"  ├─ K近邻: {ml_result.get('knn', 'N/A')}元")
+            print(f"  └─ 梯度提升: {ml_result.get('gb', 'N/A')}元")
+            print(f"  模型MAE: {ml_result['mae']:.2f}元 (PE来源: {ml_result.get('pe_source', 'N/A')})")
         else:
             print("ML模型不可用（数据不足）")
     
@@ -216,13 +217,13 @@ def train_ml():
     print("开始训练机器学习模型...")
     print("="*60)
     
-    # 训练v3 Stacking模型
-    result = train_v3()
+    result = train_ensemble_v5()
     
     if result:
         print(f"\n✓ 模型训练完成!")
         print(f"  验证集MAE: {result['mae_ensemble']:.2f}元")
         print(f"  验证集R²: {result['r2_ensemble']:.4f}")
+        print(f"  模型已保存到 models/ 目录")
     else:
         print("\n✗ 模型训练失败（数据不足）")
 
@@ -352,6 +353,6 @@ if __name__ == '__main__':
     elif args.command == 'fetch':
         # 补历史数据
         print("开始批量获取历史数据...")
-        batch_fetch_history()
+        continue_fetch_history()
     else:
         menu()

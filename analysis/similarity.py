@@ -1,11 +1,13 @@
 """
 相似度匹配模型（量化评估版）
-参考表3-7的量化评估方法：基于多维度因素对比推算目标债券价格
+参考表3-7的量化评估方法 + 正股基本面特征
 """
 import pandas as pd
 import numpy as np
 from db.models import get_session, BondInfo, StockInfo, BondDaily
 from config import SIMILARITY_WEIGHTS, RATING_MAP
+from analysis.fundamental_features import get_stock_industry_heat
+from datetime import datetime
 import warnings
 warnings.filterwarnings('ignore')
 

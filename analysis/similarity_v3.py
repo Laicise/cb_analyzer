@@ -152,11 +152,20 @@ def find_similar_bonds(bond_code, top_n=5):
     new_data['market_index'] = target_market_idx
     new_data['market_score'] = target_market_score
     
+    # 判断是否为银行转债（转股价值为None）
+    is_bank_bond = new_bond.conversion_value is None
+    
     bonds = session.query(BondInfo).filter(
         BondInfo.bond_code != bond_code,
-        BondInfo.first_open != None,
-        BondInfo.conversion_value != None
+        BondInfo.first_open != None
     ).all()
+    
+    # 如果目标债券是银行转债，则优先匹配银行转债
+    if is_bank_bond:
+        # 过滤出银行转债（转股价值为None的）
+        bank_bonds = [b for b in bonds if b.conversion_value is None]
+        if bank_bonds:
+            bonds = bank_bonds
     
     similarities = []
     
