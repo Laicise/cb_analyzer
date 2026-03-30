@@ -15,6 +15,7 @@ from scripts.calculate_yield import update_yields
 from scripts.continue_fetch import continue_fetch_history
 from analysis.similarity import find_similar_bonds, get_confidence_level
 from analysis.ml_model_v5 import train_ensemble_v5, predict_price_v5
+from analysis.ml_model_v6 import train_ensemble_v6, predict_price_v6
 from config import RATING_MAP
 from datetime import datetime
 import warnings
@@ -80,7 +81,7 @@ def show_bonds(limit=10):
     session.close()
 
 
-def predict_bond(bond_code, method='all'):
+def predict_bond(bond_code, method='all', model='v6'):
     """预测债券价格"""
     print("\n" + "="*70)
     print(f"可转债价格预测: {bond_code}")
@@ -136,21 +137,42 @@ def predict_bond(bond_code, method='all'):
             print("未找到相似债券")
     
     # 2. ML模型预测
-    if method in ['all', 'ml']:
-        print(f"\n{'='*70}")
-        print(f"【方法2: 机器学习模型 v5】")
-        print(f"{'='*70}")
-        
-        ml_result = predict_price_v5(bond_code)
-        if ml_result:
-            results['ml'] = ml_result['predicted_price']
-            print(f"  预测价格: {ml_result['predicted_price']}元")
-            print(f"  ├─ 线性回归: {ml_result.get('lr', 'N/A')}元")
-            print(f"  ├─ K近邻: {ml_result.get('knn', 'N/A')}元")
-            print(f"  └─ 梯度提升: {ml_result.get('gb', 'N/A')}元")
-            print(f"  模型MAE: {ml_result['mae']:.2f}元 (PE来源: {ml_result.get('pe_source', 'N/A')})")
+    if method in ['all', 'ml', 'mlv6']:
+        if model == 'v6':
+            print(f"\n{'='*70}")
+            print(f"【方法2: 机器学习模型 v6 (Phase 1+2优化)】")
+            print(f"{'='*70}")
+            
+            ml_result = predict_price_v6(bond_code)
+            if ml_result:
+                results['ml'] = ml_result['predicted_price']
+                print(f"  预测价格: {ml_result['predicted_price']}元")
+                print(f"  ├─ 线性回归: {ml_result.get('lr', 'N/A')}元")
+                print(f"  ├─ K近邻: {ml_result.get('knn', 'N/A')}元")
+                print(f"  ├─ 梯度提升: {ml_result.get('gb', 'N/A')}元")
+                print(f"  └─ 分位数回归: {ml_result.get('q50', 'N/A')}元")
+                print(f"  ─────────────────────────")
+                print(f"  预测区间: [{ml_result.get('p20', 'N/A')}, {ml_result.get('p80', 'N/A')}]元")
+                print(f"  区间宽度: {ml_result.get('interval_width', 'N/A')}元")
+                print(f"  市场情绪: {ml_result.get('market_sentiment', 'N/A')}")
+                print(f"  模型MAE: {ml_result['mae']:.2f}元")
+            else:
+                print("ML模型v6不可用（数据不足）")
         else:
-            print("ML模型不可用（数据不足）")
+            print(f"\n{'='*70}")
+            print(f"【方法2: 机器学习模型 v5】")
+            print(f"{'='*70}")
+            
+            ml_result = predict_price_v5(bond_code)
+            if ml_result:
+                results['ml'] = ml_result['predicted_price']
+                print(f"  预测价格: {ml_result['predicted_price']}元")
+                print(f"  ├─ 线性回归: {ml_result.get('lr', 'N/A')}元")
+                print(f"  ├─ K近邻: {ml_result.get('knn', 'N/A')}元")
+                print(f"  └─ 梯度提升: {ml_result.get('gb', 'N/A')}元")
+                print(f"  模型MAE: {ml_result['mae']:.2f}元 (PE来源: {ml_result.get('pe_source', 'N/A')})")
+            else:
+                print("ML模型不可用（数据不足）")
     
     # 综合预测
     if len(results) > 1:
@@ -211,27 +233,35 @@ def predict_bond(bond_code, method='all'):
     session.close()
 
 
-def train_ml():
+def train_ml(model='v6'):
     """训练机器学习模型"""
     print("\n" + "="*60)
-    print("开始训练机器学习模型...")
+    print(f"开始训练机器学习模型 {model}...")
     print("="*60)
     
-    result = train_ensemble_v5()
+    if model == 'v6':
+        result = train_ensemble_v6()
+    else:
+        result = train_ensemble_v5()
     
     if result:
         print(f"\n✓ 模型训练完成!")
-        print(f"  验证集MAE: {result['mae_ensemble']:.2f}元")
-        print(f"  验证集R²: {result['r2_ensemble']:.4f}")
+        if model == 'v6':
+            print(f"  Stacking MAE: {result.get('mae_stack', result.get('mae_ensemble', 0)):.2f}元")
+            print(f"  R²: {result.get('r2_stack', result.get('r2_ensemble', 0)):.4f}")
+            print(f"  预测区间覆盖率: {result.get('coverage_p20_p80', 0)*100:.1f}%")
+        else:
+            print(f"  验证集MAE: {result['mae_ensemble']:.2f}元")
+            print(f"  验证集R²: {result['r2_ensemble']:.4f}")
         print(f"  模型已保存到 models/ 目录")
     else:
         print("\n✗ 模型训练失败（数据不足）")
 
 
-def backtest():
+def backtest(model='v6'):
     """历史回测"""
     print("\n" + "="*60)
-    print("开始历史回测...")
+    print(f"开始历史回测 ({model})...")
     print("="*60)
     
     evaluate_on_history()
@@ -329,7 +359,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='可转债量化估值分析系统 v4.0')
     parser.add_argument('command', nargs='?', help='命令')
     parser.add_argument('--code', help='债券代码')
-    parser.add_argument('--method', default='all', help='预测方法: all/similarity/ml')
+    parser.add_argument('--method', default='all', help='预测方法: all/similarity/ml/mlv6')
+    parser.add_argument('--model', default='v6', help='模型版本: v5/v6')
     
     args = parser.parse_args()
     
@@ -341,15 +372,15 @@ if __name__ == '__main__':
         show_bonds()
     elif args.command == 'predict':
         if args.code:
-            predict_bond(args.code, args.method)
+            predict_bond(args.code, args.method, args.model)
         else:
             print("请指定债券代码: --code 110074")
     elif args.command == 'stats':
         stats()
     elif args.command == 'train':
-        train_ml()
+        train_ml(model=args.model)
     elif args.command == 'backtest':
-        backtest()
+        backtest(model=args.model)
     elif args.command == 'fetch':
         # 补历史数据
         print("开始批量获取历史数据...")
