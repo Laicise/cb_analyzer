@@ -18,9 +18,8 @@ import warnings
 warnings.filterwarnings('ignore')
 
 from db.models import get_session, BondInfo, StockInfo
-from analysis.ml_model_v5 import predict_price_v5, add_enhanced_features
-from analysis.fundamental_features import prepare_all_features
-from analysis.model_persistence import load_v5_model as load_model
+from analysis.ml_model_v6 import predict_price_v6
+from analysis.model_persistence import load_v6_model
 
 
 class CBPredictorApp:
@@ -50,15 +49,15 @@ class CBPredictorApp:
     def load_model_async(self):
         def load():
             try:
-                self.models, self.metadata = load_model()
+                self.models, self.metadata = load_v6_model()
                 self.model_loaded = True
                 self.root.after(0, lambda: self.status_label.config(
-                    text=f"✅ 模型已就绪 (MAE: {self.metadata.get('mae_ensemble', 7.55):.2f}元)",
+                    text=f"✅ 模型已就绪 (MAE: {self.metadata.get('mae_stack', 7.55):.2f}元)",
                     foreground="green"))
             except Exception as e:
                 self.root.after(0, lambda: self.status_label.config(
                     text="❌ 模型加载失败", foreground="red"))
-        
+
         threading.Thread(target=load, daemon=True).start()
     
     def create_widgets(self):
@@ -66,9 +65,9 @@ class CBPredictorApp:
         main_frame.pack(fill=tk.BOTH, expand=True)
         
         # 标题
-        ttk.Label(main_frame, text="可转债首日开盘价预测", 
+        ttk.Label(main_frame, text="可转债首日开盘价预测",
                   font=("Arial", 20, "bold")).pack()
-        ttk.Label(main_frame, text="基于机器学习模型的智能预测系统 | ML v5", 
+        ttk.Label(main_frame, text="基于机器学习模型的智能预测系统 | ML v6 Stacking",
                   font=("Arial", 10), foreground="gray").pack(pady=(0, 15))
         
         # 输入区域
@@ -124,7 +123,7 @@ class CBPredictorApp:
                                       font=("Arial", 9), foreground="orange")
         self.status_label.pack(side=tk.LEFT)
         
-        ttk.Label(status_frame, text="v1.0 | 样本356条 | MAE 7.55元", 
+        ttk.Label(status_frame, text="v2.0 | ML v6 Stacking | 分位数回归",
                   font=("Arial", 9), foreground="gray").pack(side=tk.RIGHT)
         
         ttk.Style().configure("Accent.TButton", font=("Arial", 13, "bold"))
@@ -148,7 +147,7 @@ class CBPredictorApp:
         
         def do_predict():
             try:
-                result = predict_price_v5(code)
+                result = predict_price_v6(code)
                 session = get_session()
                 bond = session.query(BondInfo).filter_by(bond_code=code).first()
                 session.close()
@@ -194,8 +193,9 @@ class CBPredictorApp:
   溢价率:   {prem}%
 
 【预测信息】
-  PE数据:   {result.get('pe_source', 'N/A')}
+  市场情绪: {result.get('market_sentiment', 'N/A')}
   模型MAE:  ±{result.get('mae', 7.55):.2f}元
+  预测区间: [{result.get('p20', 0):.1f}, {result.get('p80', 0):.1f}]元
 """
         self.result_text.insert(tk.END, info)
         
@@ -212,9 +212,10 @@ class CBPredictorApp:
 ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
 
 子模型预测:
-  ├─ 线性回归:   {result.get('lr', 0):.1f} 元
-  ├─ K近邻:      {result.get('knn', 0):.1f} 元
-  └─ 梯度提升:   {result.get('gb', 0):.1f} 元
+  ├─ 线性回归:     {result.get('lr', 0):.1f} 元
+  ├─ K近邻:        {result.get('knn', 0):.1f} 元
+  ├─ 梯度提升:     {result.get('gb', 0):.1f} 元
+  └─ 分位数回归Q50: {result.get('q50', 0):.1f} 元
 """
         self.result_text.insert(tk.END, pred)
         

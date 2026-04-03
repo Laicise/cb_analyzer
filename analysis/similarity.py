@@ -100,11 +100,16 @@ def find_similar_bonds(new_bond_code, top_n=5):
         BondInfo.listing_date != None,
         BondInfo.conversion_value != None
     ).all()
-    
+
+    # 批量查询StockInfo避免N+1问题
+    stock_codes = list(set([b.stock_code for b in bonds if b.stock_code]))
+    stocks = session.query(StockInfo).filter(StockInfo.stock_code.in_(stock_codes)).all()
+    stock_map = {s.stock_code: s for s in stocks}
+
     similarities = []
-    
+
     for bond in bonds:
-        stock = session.query(StockInfo).filter_by(stock_code=bond.stock_code).first()
+        stock = stock_map.get(bond.stock_code)
         
         scores = {
             'industry': get_industry_score(new_data['industry'], stock.industry_sw_l1 if stock else ''),

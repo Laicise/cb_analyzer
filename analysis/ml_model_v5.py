@@ -8,6 +8,7 @@ import numpy as np
 from db.models import get_session, BondInfo, StockInfo
 from analysis.fundamental_features import prepare_all_features
 from analysis.model_persistence import save_v5_model as save_model, load_v5_model as load_model, model_exists, get_model_age_days
+from config import ML_CONFIG
 import warnings, json
 warnings.filterwarnings('ignore')
 
@@ -198,7 +199,7 @@ def load_training_data():
     ).order_by(BondInfo.listing_date).all()
     X_list, y_list = [], []
     for bond in bonds:
-        if bond.first_open < 90 or bond.first_open > 160:
+        if bond.first_open < ML_CONFIG['price_min'] or bond.first_open > ML_CONFIG['price_max']:
             continue
         features, stock = prepare_all_features(session, bond, include_fundamental=True)
         features = add_enhanced_features(features, stock, bond)
@@ -252,23 +253,23 @@ def train_ensemble_v5(force_retrain=False):
     print("\n[1/3] 线性回归...")
     lr = LinearRegression(alpha=1.0)
     lr.fit(X_train_n, y_train)
-    pred_lr = np.clip(lr.predict(X_val_n), 90, 140)
+    pred_lr = np.clip(lr.predict(X_val_n), ML_CONFIG['pred_min'], ML_CONFIG['pred_max'])
     mae_lr = np.mean(np.abs(y_val - pred_lr))
     r2_lr = 1 - np.sum((y_val - pred_lr)**2) / np.sum((y_val - np.mean(y_val))**2)
     print(f"  MAE: {mae_lr:.2f}元, R2: {r2_lr:.4f}")
 
     print("\n[2/3] K近邻...")
     knn = KNN(k=5)
-    knn.fit(X_train, y_train)
-    pred_knn = np.clip(knn.predict(X_val), 90, 140)
+    knn.fit(X_train_n, y_train)  # 使用归一化数据
+    pred_knn = np.clip(knn.predict(X_val_n), ML_CONFIG['pred_min'], ML_CONFIG['pred_max'])
     mae_knn = np.mean(np.abs(y_val - pred_knn))
     r2_knn = 1 - np.sum((y_val - pred_knn)**2) / np.sum((y_val - np.mean(y_val))**2)
     print(f"  MAE: {mae_knn:.2f}元, R2: {r2_knn:.4f}")
 
     print("\n[3/3] 梯度提升...")
-    gb = GradientBoosting(n_trees=50, max_depth=3, lr=0.08)
+    gb = GradientBoosting(n_trees=ML_CONFIG['gb_n_trees'], max_depth=ML_CONFIG['gb_max_depth'], lr=ML_CONFIG['gb_lr'])
     gb.fit(X_train_n, y_train)
-    pred_gb = np.clip(gb.predict(X_val_n), 90, 140)
+    pred_gb = np.clip(gb.predict(X_val_n), ML_CONFIG['pred_min'], ML_CONFIG['pred_max'])
     mae_gb = np.mean(np.abs(y_val - pred_gb))
     r2_gb = 1 - np.sum((y_val - pred_gb)**2) / np.sum((y_val - np.mean(y_val))**2)
     print(f"  MAE: {mae_gb:.2f}元, R2: {r2_gb:.4f}")
@@ -288,7 +289,7 @@ def train_ensemble_v5(force_retrain=False):
             j += 1
 
     pred_ens = weights[0] * pred_lr + weights[1] * pred_knn + weights[2] * pred_gb
-    pred_ens = np.clip(pred_ens, 90, 140)
+    pred_ens = np.clip(pred_ens, ML_CONFIG['pred_min'], ML_CONFIG['pred_max'])
     mae_ens = np.mean(np.abs(y_val - pred_ens))
     r2_ens = 1 - np.sum((y_val - pred_ens)**2) / np.sum((y_val - np.mean(y_val))**2)
 
@@ -307,7 +308,7 @@ def train_ensemble_v5(force_retrain=False):
     print("\n全量训练...")
     X_n, mean_full, std_full = normalize(X)
     lr.fit(X_n, y)
-    knn.fit(X, y)
+    knn.fit(X_n, y)  # KNN使用归一化数据
     gb.fit(X_n, y)
 
     models_to_save = {
@@ -361,9 +362,9 @@ def predict_price_v5(bond_code):
     mean, std = _models_v5['norm']
     Xn = (arr - mean) / (std + 1e-8)
 
-    pred_lr = np.clip(_models_v5['lr'].predict(Xn), 90, 140)[0]
-    pred_knn = np.clip(_models_v5['knn'].predict(arr), 90, 140)[0]
-    pred_gb = np.clip(_models_v5['gb'].predict(Xn), 90, 140)[0]
+    pred_lr = np.clip(_models_v5['lr'].predict(Xn), ML_CONFIG['pred_min'], ML_CONFIG['pred_max'])[0]
+    pred_knn = np.clip(_models_v5['knn'].predict(Xn), ML_CONFIG['pred_min'], ML_CONFIG['pred_max'])[0]  # 使用归一化数据
+    pred_gb = np.clip(_models_v5['gb'].predict(Xn), ML_CONFIG['pred_min'], ML_CONFIG['pred_max'])[0]
 
     weights = _models_v5['weights']
     pred = weights[0] * pred_lr + weights[1] * pred_knn + weights[2] * pred_gb

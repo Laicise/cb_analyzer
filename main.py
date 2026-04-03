@@ -60,25 +60,26 @@ def update_data():
 def show_bonds(limit=10):
     """显示可转债列表"""
     session = get_session()
-    bonds = session.query(BondInfo).limit(limit).all()
-    
-    print(f"\n{'代码':<8} {'名称':<10} {'正股':<10} {'行业':<12} {'转股价值':<10} {'溢价率':<8} {'现价':<8} {'首日':<8}")
-    print("-"*80)
-    
-    for bond in bonds:
-        stock = session.query(StockInfo).filter_by(stock_code=bond.stock_code).first()
-        industry = stock.industry_sw_l1 if stock and stock.industry_sw_l1 else '-'
-        
-        latest = session.query(BondDaily).filter_by(bond_code=bond.bond_code).order_by(BondDaily.trade_date.desc()).first()
-        price = f"{latest.close_price:.2f}" if latest and latest.close_price else '-'
-        
-        cv = f"{bond.conversion_value:.1f}" if bond.conversion_value else '-'
-        prem = f"{bond.premium_rate:.1f}%" if bond.premium_rate else '-'
-        first = f"{bond.first_open:.2f}" if bond.first_open else '-'
-        
-        print(f"{bond.bond_code:<8} {bond.bond_name:<10} {bond.stock_name:<10} {industry:<12} {cv:<10} {prem:<8} {price:<8} {first:<8}")
-    
-    session.close()
+    try:
+        bonds = session.query(BondInfo).limit(limit).all()
+
+        print(f"\n{'代码':<8} {'名称':<10} {'正股':<10} {'行业':<12} {'转股价值':<10} {'溢价率':<8} {'现价':<8} {'首日':<8}")
+        print("-"*80)
+
+        for bond in bonds:
+            stock = session.query(StockInfo).filter_by(stock_code=bond.stock_code).first()
+            industry = stock.industry_sw_l1 if stock and stock.industry_sw_l1 else '-'
+
+            latest = session.query(BondDaily).filter_by(bond_code=bond.bond_code).order_by(BondDaily.trade_date.desc()).first()
+            price = f"{latest.close_price:.2f}" if latest and latest.close_price else '-'
+
+            cv = f"{bond.conversion_value:.1f}" if bond.conversion_value else '-'
+            prem = f"{bond.premium_rate:.1f}%" if bond.premium_rate else '-'
+            first = f"{bond.first_open:.2f}" if bond.first_open else '-'
+
+            print(f"{bond.bond_code:<8} {bond.bond_name:<10} {bond.stock_name:<10} {industry:<12} {cv:<10} {prem:<8} {price:<8} {first:<8}")
+    finally:
+        session.close()
 
 
 def predict_bond(bond_code, method='all', model='v6'):
@@ -86,14 +87,14 @@ def predict_bond(bond_code, method='all', model='v6'):
     print("\n" + "="*70)
     print(f"可转债价格预测: {bond_code}")
     print("="*70)
-    
+
     session = get_session()
-    bond = session.query(BondInfo).filter_by(bond_code=bond_code).first()
-    
-    if not bond:
-        print(f"未找到债券 {bond_code}")
-        session.close()
-        return
+    try:
+        bond = session.query(BondInfo).filter_by(bond_code=bond_code).first()
+
+        if not bond:
+            print(f"未找到债券 {bond_code}")
+            return
     
     stock = session.query(StockInfo).filter_by(stock_code=bond.stock_code).first()
     
@@ -229,8 +230,8 @@ def predict_bond(bond_code, method='all', model='v6'):
     
     if bond.first_open and results:
         print(f"\n★ 对比实际: {bond.first_open}元, 误差: {abs(round(avg_price,2) - bond.first_open):.2f}元 ({abs(round(avg_price,2) - bond.first_open)/bond.first_open*100:.1f}%)")
-    
-    session.close()
+    finally:
+        session.close()
 
 
 def train_ml(model='v6'):
@@ -270,47 +271,47 @@ def backtest(model='v6'):
 def stats():
     """显示统计信息"""
     session = get_session()
-    
-    bond_count = session.query(BondInfo).count()
-    stock_count = session.query(StockInfo).count()
-    first_day_count = session.query(BondInfo).filter(BondInfo.first_open != None).count()
-    
-    # 基本面覆盖
-    has_pe = session.query(StockInfo).filter(StockInfo.pe != None).count()
-    has_pb = session.query(StockInfo).filter(StockInfo.pb != None).count()
-    
-    # 预测统计
-    pred_total = session.query(PredictionRecord).count()
-    pred_confirmed = session.query(PredictionRecord).filter_by(status='confirmed').count()
-    
-    print("\n" + "="*60)
-    print("数据统计")
-    print("="*60)
-    print(f"可转债数量: {bond_count}")
-    print(f"正股信息数量: {stock_count}")
-    print(f"  - 有PE数据: {has_pe}")
-    print(f"  - 有PB数据: {has_pb}")
-    print(f"首日数据数量: {first_day_count}")
-    print(f"预测记录: {pred_total} (已确认 {pred_confirmed})")
-    
-    # 预测误差统计
-    records = session.query(PredictionRecord).filter(
-        PredictionRecord.error_rate != None,
-        PredictionRecord.error_rate < 50  # 排除异常值
-    ).all()
-    
-    if records:
-        errors = [r.error_rate for r in records]
-        avg_error = sum(errors) / len(errors)
-        within_5 = sum(1 for e in errors if e <= 5)
-        within_10 = sum(1 for e in errors if e <= 10)
-        
-        print(f"\n预测误差统计:")
-        print(f"  平均误差: {avg_error:.2f}%")
-        print(f"  误差≤5%: {within_5}条 ({within_5/len(errors)*100:.0f}%)")
-        print(f"  误差≤10%: {within_10}条 ({within_10/len(errors)*100:.0f}%)")
-    
-    session.close()
+    try:
+        bond_count = session.query(BondInfo).count()
+        stock_count = session.query(StockInfo).count()
+        first_day_count = session.query(BondInfo).filter(BondInfo.first_open != None).count()
+
+        # 基本面覆盖
+        has_pe = session.query(StockInfo).filter(StockInfo.pe != None).count()
+        has_pb = session.query(StockInfo).filter(StockInfo.pb != None).count()
+
+        # 预测统计
+        pred_total = session.query(PredictionRecord).count()
+        pred_confirmed = session.query(PredictionRecord).filter_by(status='confirmed').count()
+
+        print("\n" + "="*60)
+        print("数据统计")
+        print("="*60)
+        print(f"可转债数量: {bond_count}")
+        print(f"正股信息数量: {stock_count}")
+        print(f"  - 有PE数据: {has_pe}")
+        print(f"  - 有PB数据: {has_pb}")
+        print(f"首日数据数量: {first_day_count}")
+        print(f"预测记录: {pred_total} (已确认 {pred_confirmed})")
+
+        # 预测误差统计
+        records = session.query(PredictionRecord).filter(
+            PredictionRecord.error_rate != None,
+            PredictionRecord.error_rate < 50  # 排除异常值
+        ).all()
+
+        if records:
+            errors = [r.error_rate for r in records]
+            avg_error = sum(errors) / len(errors)
+            within_5 = sum(1 for e in errors if e <= 5)
+            within_10 = sum(1 for e in errors if e <= 10)
+
+            print(f"\n预测误差统计:")
+            print(f"  平均误差: {avg_error:.2f}%")
+            print(f"  误差≤5%: {within_5}条 ({within_5/len(errors)*100:.0f}%)")
+            print(f"  误差≤10%: {within_10}条 ({within_10/len(errors)*100:.0f}%)")
+    finally:
+        session.close()
 
 
 def menu():

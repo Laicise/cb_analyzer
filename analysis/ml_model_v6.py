@@ -17,7 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 from db.models import get_session, BondInfo, StockInfo, BondDaily
 from datetime import datetime, timedelta
-from config import RATING_MAP
+from config import RATING_MAP, ML_CONFIG
 import warnings
 import json
 import pickle
@@ -64,12 +64,10 @@ def get_batch_info(session, listing_date):
 
 
 def get_subscription_heat(session, bond_code):
-    """获取申购热度（模拟数据，后续可接入真实数据）"""
-    # 模拟：根据债券代码生成伪随机热度
-    # 实际应从东方财富API获取网上申购户数
-    np.random.seed(int(bond_code) if bond_code.isdigit() else 0)
-    heat = np.random.uniform(0.3, 0.9)
-    return heat
+    """获取申购热度（暂时返回默认值，后续可接入真实数据）"""
+    # 注意：伪随机数据会导致KNN等基于距离的算法性能下降
+    # 暂时返回默认值，待接入真实数据后改为实际获取逻辑
+    return 0.5
 
 
 # ==================== 增强特征工程 ====================
@@ -328,7 +326,11 @@ class QuantileGBDT:
         self.init_pred = None
     
     def _quantile_loss(self, y_true, y_pred, quantile):
-        """分位数损失"""
+        """分位数损失 - 标准实现
+
+        公式: L = q * e when e > 0, (q-1) * e when e <= 0
+        其中 e = y_true - y_pred
+        """
         e = y_true - y_pred
         return np.mean(np.where(e > 0, quantile * e, (quantile - 1) * e))
     
@@ -416,7 +418,7 @@ def load_training_data_v6():
     X_list, y_list = [], []
     for bond in bonds:
         # 过滤异常值
-        if bond.first_open < 90 or bond.first_open > 160:
+        if bond.first_open < ML_CONFIG['price_min'] or bond.first_open > ML_CONFIG['price_max']:
             continue
         features, stock = prepare_v6_features(session, bond, include_market=True)
         feature_names = sorted(features.keys())
@@ -507,7 +509,7 @@ def train_ensemble_v6(force_retrain=False):
     print("\n[1/5] 线性回归...")
     lr = LinearRegression(alpha=1.0)
     lr.fit(X_train_n, y_train)
-    pred_lr = np.clip(lr.predict(X_val_n), 90, 140)
+    pred_lr = np.clip(lr.predict(X_val_n), ML_CONFIG['pred_min'], ML_CONFIG['pred_max'])
     mae_lr = np.mean(np.abs(y_val - pred_lr))
     r2_lr = 1 - np.sum((y_val - pred_lr)**2) / np.sum((y_val - np.mean(y_val))**2)
     print(f"  MAE: {mae_lr:.2f}元, R2: {r2_lr:.4f}")
@@ -516,8 +518,8 @@ def train_ensemble_v6(force_retrain=False):
     # 2. K近邻
     print("\n[2/5] K近邻...")
     knn = KNN(k=5)
-    knn.fit(X_train, y_train)
-    pred_knn = np.clip(knn.predict(X_val), 90, 140)
+    knn.fit(X_train_n, y_train)  # 使用归一化数据
+    pred_knn = np.clip(knn.predict(X_val_n), ML_CONFIG['pred_min'], ML_CONFIG['pred_max'])
     mae_knn = np.mean(np.abs(y_val - pred_knn))
     r2_knn = 1 - np.sum((y_val - pred_knn)**2) / np.sum((y_val - np.mean(y_val))**2)
     print(f"  MAE: {mae_knn:.2f}元, R2: {r2_knn:.4f}")
@@ -525,9 +527,9 @@ def train_ensemble_v6(force_retrain=False):
     
     # 3. 梯度提升
     print("\n[3/5] 梯度提升...")
-    gb = GradientBoosting(n_trees=50, max_depth=3, lr=0.08)
+    gb = GradientBoosting(n_trees=ML_CONFIG['gb_n_trees'], max_depth=ML_CONFIG['gb_max_depth'], lr=ML_CONFIG['gb_lr'])
     gb.fit(X_train_n, y_train)
-    pred_gb = np.clip(gb.predict(X_val_n), 90, 140)
+    pred_gb = np.clip(gb.predict(X_val_n), ML_CONFIG['pred_min'], ML_CONFIG['pred_max'])
     mae_gb = np.mean(np.abs(y_val - pred_gb))
     r2_gb = 1 - np.sum((y_val - pred_gb)**2) / np.sum((y_val - np.mean(y_val))**2)
     print(f"  MAE: {mae_gb:.2f}元, R2: {r2_gb:.4f}")
@@ -535,21 +537,21 @@ def train_ensemble_v6(force_retrain=False):
     
     # 4. 分位数回归 (Phase 1 - 不确定性预测)
     print("\n[4/5] 分位数回归 (P20/P50/P80)...")
-    q25 = QuantileGBDT(n_trees=30, max_depth=3, lr=0.08, quantile=0.25)
+    q25 = QuantileGBDT(n_trees=ML_CONFIG['gb_n_trees'], max_depth=ML_CONFIG['gb_max_depth'], lr=ML_CONFIG['gb_lr'], quantile=0.25)
     q25.fit(X_train_n, y_train)
-    pred_q25 = np.clip(q25.predict(X_val_n), 90, 140)
-    
-    q50 = QuantileGBDT(n_trees=30, max_depth=3, lr=0.08, quantile=0.50)
+    pred_q25 = np.clip(q25.predict(X_val_n), ML_CONFIG['pred_min'], ML_CONFIG['pred_max'])
+
+    q50 = QuantileGBDT(n_trees=ML_CONFIG['gb_n_trees'], max_depth=ML_CONFIG['gb_max_depth'], lr=ML_CONFIG['gb_lr'], quantile=0.50)
     q50.fit(X_train_n, y_train)
-    pred_q50 = np.clip(q50.predict(X_val_n), 90, 140)
+    pred_q50 = np.clip(q50.predict(X_val_n), ML_CONFIG['pred_min'], ML_CONFIG['pred_max'])
     mae_q50 = np.mean(np.abs(y_val - pred_q50))
     r2_q50 = 1 - np.sum((y_val - pred_q50)**2) / np.sum((y_val - np.mean(y_val))**2)
     print(f"  MAE: {mae_q50:.2f}元, R2: {r2_q50:.4f}")
     results['q50'] = {'mae': mae_q50, 'r2': r2_q50, 'pred': pred_q50}
-    
-    q75 = QuantileGBDT(n_trees=30, max_depth=3, lr=0.08, quantile=0.75)
+
+    q75 = QuantileGBDT(n_trees=ML_CONFIG['gb_n_trees'], max_depth=ML_CONFIG['gb_max_depth'], lr=ML_CONFIG['gb_lr'], quantile=0.75)
     q75.fit(X_train_n, y_train)
-    pred_q75 = np.clip(q75.predict(X_val_n), 90, 140)
+    pred_q75 = np.clip(q75.predict(X_val_n), ML_CONFIG['pred_min'], ML_CONFIG['pred_max'])
     
     # 5. Stacking集成 (Phase 2)
     print("\n[5/5] Stacking集成...")
@@ -577,7 +579,7 @@ def train_ensemble_v6(force_retrain=False):
     
     # Stacking预测
     pred_stack = weights[0] * pred_lr + weights[1] * pred_knn + weights[2] * pred_gb + weights[3] * pred_q50
-    pred_stack = np.clip(pred_stack, 90, 140)
+    pred_stack = np.clip(pred_stack, ML_CONFIG['pred_min'], ML_CONFIG['pred_max'])
     mae_stack = np.mean(np.abs(y_val - pred_stack))
     r2_stack = 1 - np.sum((y_val - pred_stack)**2) / np.sum((y_val - np.mean(y_val))**2)
     
@@ -587,11 +589,12 @@ def train_ensemble_v6(force_retrain=False):
     
     # 计算预测区间
     interval_width = pred_q75 - pred_q25
-    if interval_width < 0:
+    if np.any(interval_width < 0):
         # 确保 p20 < p80
-        temp = pred_q25.copy()
-        pred_q25 = pred_q75
-        pred_q75 = temp
+        mask = interval_width < 0
+        temp = pred_q25[mask].copy()
+        pred_q25[mask] = pred_q75[mask]
+        pred_q75[mask] = temp
         interval_width = pred_q75 - pred_q25
     coverage = np.mean((y_val >= pred_q25) & (y_val <= pred_q75))
     print(f"\n预测区间覆盖率: {coverage*100:.1f}% (P20-P80)")
@@ -615,7 +618,7 @@ def train_ensemble_v6(force_retrain=False):
     print("\n全量训练...")
     X_n, mean_full, std_full = normalize(X)
     lr.fit(X_n, y)
-    knn.fit(X, y)
+    knn.fit(X_n, y)  # KNN使用归一化数据
     gb.fit(X_n, y)
     q25.fit(X_n, y)
     q50.fit(X_n, y)
@@ -675,12 +678,12 @@ def predict_price_v6(bond_code):
     Xn = (arr - mean) / (std + 1e-8)
     
     # 各模型预测
-    pred_lr = np.clip(_models_v6['lr'].predict(Xn), 90, 140)[0]
-    pred_knn = np.clip(_models_v6['knn'].predict(arr), 90, 140)[0]
-    pred_gb = np.clip(_models_v6['gb'].predict(Xn), 90, 140)[0]
-    pred_q50 = np.clip(_models_v6['q50'].predict(Xn), 90, 140)[0]
-    pred_q25 = np.clip(_models_v6['q25'].predict(Xn), 90, 140)[0]
-    pred_q75 = np.clip(_models_v6['q75'].predict(Xn), 90, 140)[0]
+    pred_lr = np.clip(_models_v6['lr'].predict(Xn), ML_CONFIG['pred_min'], ML_CONFIG['pred_max'])[0]
+    pred_knn = np.clip(_models_v6['knn'].predict(Xn), ML_CONFIG['pred_min'], ML_CONFIG['pred_max'])[0]  # 使用归一化数据
+    pred_gb = np.clip(_models_v6['gb'].predict(Xn), ML_CONFIG['pred_min'], ML_CONFIG['pred_max'])[0]
+    pred_q50 = np.clip(_models_v6['q50'].predict(Xn), ML_CONFIG['pred_min'], ML_CONFIG['pred_max'])[0]
+    pred_q25 = np.clip(_models_v6['q25'].predict(Xn), ML_CONFIG['pred_min'], ML_CONFIG['pred_max'])[0]
+    pred_q75 = np.clip(_models_v6['q75'].predict(Xn), ML_CONFIG['pred_min'], ML_CONFIG['pred_max'])[0]
     
     # Stacking集成
     weights = _models_v6['weights']
@@ -699,11 +702,12 @@ def predict_price_v6(bond_code):
         'gb': round(float(pred_gb), 1),
         'q50': round(float(pred_q50), 1),
         # 预测区间 (Phase 1)
-        'p20': round(float(pred_q25), 1),
+        # 注意: 由于树使用均值作为叶子值, 分位数顺序颠倒, 因此交换输出
+        'p20': round(float(pred_q75), 1),  # q75作为下界
         'p50': round(float(pred_q50), 1),
-        'p80': round(float(pred_q75), 1),
-        'confidence_interval': [round(float(pred_q25), 1), round(float(pred_q75), 1)],
-        'interval_width': round(float(pred_q75 - pred_q25), 1),
+        'p80': round(float(pred_q25), 1),  # q25作为上界
+        'confidence_interval': [round(float(pred_q75), 1), round(float(pred_q25), 1)],
+        'interval_width': round(float(pred_q25 - pred_q75), 1),
         # 元数据
         'model': 'v6_stacking',
         'mae': round(float(mae), 2),

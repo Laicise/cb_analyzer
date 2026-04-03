@@ -37,3 +37,27 @@ RATING_MAP = {
     'AAA': 5, 'AA+': 4, 'AA': 3, 'AA-': 2, 'A+': 1, 'A': 0,
     'A-': -1, 'BBB+': -2, 'BBB': -3, 'BBB-': -4, 'BB': -5, 'B': -6
 }
+
+# ML模型配置
+ML_CONFIG = {
+    # 价格过滤范围
+    'price_min': 90,
+    'price_max': 160,
+    # KNN配置
+    'knn_k': 5,
+    # 梯度提升配置
+    'gb_n_trees': 50,
+    'gb_max_depth': 3,
+    'gb_lr': 0.08,
+    # 线性回归正则化
+    'lr_alpha': 1.0,
+    # 预测价格范围
+    'pred_min': 90,
+    'pred_max': 140,
+}
+
+# 相似度算法配置
+SIMILARITY_CONFIG = {
+    'top_n': 5,  # 查找相似债券数量
+    'cv_max_diff': 15,  # 转股价值差异阈值
+}

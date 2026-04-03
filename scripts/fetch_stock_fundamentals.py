@@ -10,18 +10,32 @@ import akshare as ak
 import pandas as pd
 from datetime import datetime
 from db.models import get_session, StockInfo, BondInfo, UpdateLog
+import time
 import warnings
 warnings.filterwarnings('ignore')
+
+
+def fetch_with_retry(func, *args, max_retries=3, **kwargs):
+    """带重试的API调用"""
+    for retry in range(max_retries):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            if retry < max_retries - 1:
+                wait_time = (retry + 1) * 2  # 指数退避: 2, 4, 6秒
+                time.sleep(wait_time)
+            else:
+                raise e
 
 
 def fetch_stock_essential_info(stock_code):
     """获取个股基本面核心指标"""
     try:
-        # 东方财富个股信息
-        df = ak.stock_individual_info_em(symbol=stock_code)
+        # 东方财富个股信息（带重试）
+        df = fetch_with_retry(ak.stock_individual_info_em, symbol=stock_code)
         if df is None or len(df) == 0:
             return None
-        
+
         info = dict(zip(df['item'], df['value']))
         
         result = {
@@ -175,11 +189,10 @@ def fetch_all_stock_fundamentals():
             print(f"[{i+1}/{total}] {stock_code} {bond.stock_name} - PE:{essential.get('pe','N/A')} PB:{essential.get('pb','N/A')} 市值:{essential.get('total_market_cap','N/A')}亿")
         else:
             failed += 1
-        
-        # 避免请求过快
-        if i % 5 == 0:
-            import time
-            time.sleep(0.3)
+
+        # 避免请求过快：每5只股票sleep一次
+        if i % 5 == 4:
+            time.sleep(0.5)
     
     session.commit()
     
