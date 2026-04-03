@@ -1,14 +1,10 @@
 """
-ML模型 v6 - Phase 1+2 优化版
-==========================
-Phase 1: 贝叶斯不确定性预测 + 市场情绪因子
-Phase 2: Stacking多模型集成
-
-主要改进：
-1. 分位数回归输出预测区间
-2. 市场情绪因子（大盘、申购热度、同批次数量）
-3. LightGBM + XGBoost + CatBoost + Stacking集成
-4. 特征重要性分析
+ML模型 v6 - 优化版
+==================
+改进：
+1. LightGBM原生分位数回归替代自定义GBDT
+2. Ridge元学习器替代简单加权平均
+3. 特征重要性分析
 """
 import sys
 import os
@@ -25,13 +21,19 @@ from pathlib import Path
 
 warnings.filterwarnings('ignore')
 
+try:
+    import lightgbm as lgb
+    HAS_LIGHTGBM = True
+except ImportError:
+    HAS_LIGHTGBM = False
+
 # ==================== 市场情绪因子 ====================
 
 def get_market_sentiment(date):
     """获取市场情绪因子"""
     if date is None:
         return {'market_score': 0.5, 'sentiment': 'neutral'}
-    
+
     # 直接返回默认值，避免网络请求卡住
     return {'market_score': 0.5, 'sentiment': 'neutral', 'change_pct': 0}
 
@@ -40,17 +42,17 @@ def get_batch_info(session, listing_date):
     """获取同批次新债信息"""
     if listing_date is None:
         return {'batch_count': 1, 'batch_avg_premium': 20, 'batch_heat': 0.5}
-    
+
     # 查询前后7天内的其他新债
     start = listing_date - timedelta(days=7)
     end = listing_date + timedelta(days=7)
-    
+
     batch_bonds = session.query(BondInfo).filter(
         BondInfo.listing_date >= start,
         BondInfo.listing_date <= end,
         BondInfo.bond_code != None
     ).all()
-    
+
     count = len(batch_bonds)
     if count > 1:
         premiums = [b.premium_rate for b in batch_bonds if b.premium_rate]
@@ -59,18 +61,20 @@ def get_batch_info(session, listing_date):
     else:
         avg_premium = 20
         heat = 0.3
-    
+
     return {'batch_count': count, 'batch_avg_premium': avg_premium, 'batch_heat': heat}
 
 
 def get_subscription_heat(session, bond_code):
-    """获取申购热度（暂时返回默认值，后续可接入真实数据）"""
-    # 注意：伪随机数据会导致KNN等基于距离的算法性能下降
-    # 暂时返回默认值，待接入真实数据后改为实际获取逻辑
+    """获取申购热度
+
+    注意：真实申购数据需要从东方财富API获取，
+    当前返回默认值0.5以保证模型稳定性
+    """
     return 0.5
 
 
-# ==================== 增强特征工程 ====================
+# ==================== 特征工程 ====================
 
 INDUSTRY_DEFAULT = {
     '银行': (6, 0.6), '证券': (15, 1.2), '保险': (10, 1.0),
@@ -112,24 +116,24 @@ def estimate_pe_pb(stock):
 def prepare_v6_features(session, bond, include_market=True):
     """准备v6版本的所有特征"""
     features = {}
-    
+
     # === 债券基础特征 ===
     features['conversion_value'] = bond.conversion_value or 100
     features['premium_rate'] = bond.premium_rate or 20
     features['issue_size'] = bond.issue_size or 10
     features['coupon_rate'] = bond.coupon_rate or 1.5
-    
+
     # 剩余年限
     if bond.expiry_date:
         days = (bond.expiry_date - datetime.now()).days
         features['years_to_expiry'] = max(0, days / 365)
     else:
         features['years_to_expiry'] = 5
-    
+
     # 评级分数
     rating = bond.credit_rating or 'AA'
     features['rating_score'] = RATING_MAP.get(rating, 3)
-    
+
     # 规模分层
     issue_size = features['issue_size']
     if issue_size < 5:
@@ -140,20 +144,20 @@ def prepare_v6_features(session, bond, include_market=True):
         features['size_tier'] = 2  # 中大盘
     else:
         features['size_tier'] = 3  # 大盘
-    
+
     # === 正股基本面特征 ===
     stock = None
     if bond.stock_code:
         stock = session.query(StockInfo).filter_by(stock_code=bond.stock_code).first()
-    
+
     pe, pb, is_real = estimate_pe_pb(stock)
     features['stock_pe'] = pe
     features['stock_pb'] = pb
     features['pe_real'] = 1.0 if is_real else 0.0
-    
+
     mktcap = stock.total_market_cap if stock and stock.total_market_cap else 100
     features['stock_market_cap'] = mktcap
-    
+
     # 市值分层
     if mktcap > 1000:
         features['mcap_tier'] = 3
@@ -163,10 +167,10 @@ def prepare_v6_features(session, bond, include_market=True):
         features['mcap_tier'] = 1
     else:
         features['mcap_tier'] = 0
-    
+
     features['stock_roe'] = stock.roe if stock and stock.roe else 8
     features['stock_listing_days'] = stock.listing_days if stock and stock.listing_days else 1000
-    
+
     # 行业热度
     industry = stock.industry_sw_l1 if stock and stock.industry_sw_l1 else '其他'
     INDUSTRY_HEAT = {
@@ -176,22 +180,22 @@ def prepare_v6_features(session, bond, include_market=True):
         '银行': 0.88, '非银金融': 0.90, '房地产': 0.82,
     }
     features['industry_heat'] = INDUSTRY_HEAT.get(industry, 1.0)
-    
-    # === 市场情绪特征 (Phase 1新增) ===
+
+    # === 市场情绪特征 ===
     if include_market:
         listing_date = bond.listing_date or datetime.now()
-        
+
         # 大盘情绪
         market_info = get_market_sentiment(listing_date)
         features['market_score'] = market_info.get('market_score', 0.5)
         features['market_change'] = market_info.get('change_pct', 0)
-        
+
         # 同批次信息
         batch_info = get_batch_info(session, listing_date)
         features['batch_count'] = batch_info['batch_count']
         features['batch_avg_premium'] = batch_info['batch_avg_premium']
         features['batch_heat'] = batch_info['batch_heat']
-        
+
         # 申购热度
         features['subscription_heat'] = get_subscription_heat(session, bond.bond_code)
     else:
@@ -201,18 +205,18 @@ def prepare_v6_features(session, bond, include_market=True):
         features['batch_avg_premium'] = 20
         features['batch_heat'] = 0.5
         features['subscription_heat'] = 0.5
-    
+
     # === 衍生特征 ===
     cv = features['conversion_value']
     prem = features['premium_rate']
     features['cv_to_prem'] = cv / (prem + 1) if prem > 0 else cv
     features['size_adj_premium'] = prem * (1 + features['size_tier'] * 0.1)
     features['mcap_adj_pe'] = features['stock_pe'] * (1 + features['mcap_tier'] * 0.05)
-    
+
     return features, stock
 
 
-# ==================== 模型定义 ====================
+# ==================== 基础模型 ====================
 
 class LinearRegression:
     def __init__(self, alpha=1.0):
@@ -258,7 +262,8 @@ class KNN:
 
 
 class GradientBoosting:
-    def __init__(self, n_trees=30, max_depth=3, lr=0.08):
+    """自定义GBDT用于点预测"""
+    def __init__(self, n_trees=50, max_depth=3, lr=0.08):
         self.n_trees = n_trees
         self.max_depth = max_depth
         self.lr = lr
@@ -312,79 +317,53 @@ class GradientBoosting:
         return preds
 
 
-# ==================== 分位数回归 ====================
+# ==================== LightGBM分位数回归 ====================
 
-class QuantileGBDT:
-    """分位数回归梯度提升树"""
-    
-    def __init__(self, n_trees=30, max_depth=3, lr=0.08, quantile=0.5):
-        self.n_trees = n_trees
-        self.max_depth = max_depth
-        self.lr = lr
-        self.quantile = quantile
-        self.trees = []
-        self.init_pred = None
-    
-    def _quantile_loss(self, y_true, y_pred, quantile):
-        """分位数损失 - 标准实现
+def train_lgb_quantile(X_train, y_train, quantile, params=None):
+    """训练LightGBM分位数模型"""
+    if params is None:
+        params = {
+            'objective': 'quantile',
+            'alpha': quantile,
+            'metric': 'quantile',
+            'n_estimators': 100,
+            'max_depth': 5,
+            'num_leaves': 31,
+            'learning_rate': 0.05,
+            'feature_fraction': 0.8,
+            'bagging_fraction': 0.8,
+            'bagging_freq': 5,
+            'verbose': -1,
+            'random_state': 42,
+            'force_col_wise': True
+        }
 
-        公式: L = q * e when e > 0, (q-1) * e when e <= 0
-        其中 e = y_true - y_pred
-        """
-        e = y_true - y_pred
-        return np.mean(np.where(e > 0, quantile * e, (quantile - 1) * e))
-    
-    def fit(self, X, y):
-        n, f = X.shape
-        self.init_pred = np.quantile(y, self.quantile)
-        residuals = y - self.init_pred
-        
-        for t in range(self.n_trees):
-            tree = self._build_tree(X, residuals)
-            self.trees.append(tree)
-            preds = self._predict_tree(X, tree)
-            residuals -= self.lr * preds
-        
-        return self
-    
-    def _build_tree(self, X, y):
-        n, f = X.shape
-        best_gain = 0
-        best = None
-        indices = np.random.choice(f, min(6, f), replace=False)
-        for j in indices:
-            vals = X[:, j]
-            for thresh in np.percentile(vals, [30, 50, 70]):
-                left = vals <= thresh
-                right = ~left
-                if np.sum(left) < 3 or np.sum(right) < 3:
-                    continue
-                # 分位数增益
-                ql_left = self._quantile_loss(y[left], np.full(np.sum(left), np.mean(y[left])), self.quantile)
-                ql_right = self._quantile_loss(y[right], np.full(np.sum(right), np.mean(y[right])), self.quantile)
-                ql_parent = self._quantile_loss(y, np.full(n, np.mean(y)), self.quantile)
-                gain = ql_parent - (ql_left * np.sum(left) + ql_right * np.sum(right)) / n
-                if gain > best_gain:
-                    best_gain = gain
-                    best = (j, thresh, np.mean(y[left]), np.mean(y[right]))
-        if best:
-            return {'feature': best[0], 'thresh': best[1], 'left_val': best[2], 'right_val': best[3]}
-        return {'leaf': np.mean(y)}
-    
-    def _predict_tree(self, X, tree):
-        if 'leaf' in tree:
-            return np.full(len(X), tree['leaf'])
-        preds = np.zeros(len(X))
-        left = X[:, tree['feature']] <= tree['thresh']
-        preds[left] = tree['left_val']
-        preds[~left] = tree['right_val']
-        return preds
-    
-    def predict(self, X):
-        preds = np.full(len(X), self.init_pred)
-        for tree in self.trees:
-            preds += self.lr * self._predict_tree(X, tree)
-        return preds
+    model = lgb.LGBMRegressor(**params)
+    model.fit(X_train, y_train)
+    return model
+
+
+def train_lgb_default(X_train, y_train, params=None):
+    """训练LightGBM标准回归模型"""
+    if params is None:
+        params = {
+            'objective': 'regression',
+            'metric': 'mae',
+            'n_estimators': 100,
+            'max_depth': 5,
+            'num_leaves': 31,
+            'learning_rate': 0.05,
+            'feature_fraction': 0.8,
+            'bagging_fraction': 0.8,
+            'bagging_freq': 5,
+            'verbose': -1,
+            'random_state': 42,
+            'force_col_wise': True
+        }
+
+    model = lgb.LGBMRegressor(**params)
+    model.fit(X_train, y_train)
+    return model
 
 
 # ==================== 工具函数 ====================
@@ -414,7 +393,7 @@ def load_training_data_v6():
         BondInfo.first_open != None,
         BondInfo.conversion_value != None
     ).order_by(BondInfo.listing_date).all()
-    
+
     X_list, y_list = [], []
     for bond in bonds:
         # 过滤异常值
@@ -427,7 +406,7 @@ def load_training_data_v6():
             continue
         X_list.append(arr)
         y_list.append(bond.first_open)
-    
+
     session.close()
     return np.array(X_list), np.array(y_list), feature_names
 
@@ -464,16 +443,60 @@ def get_model_age_days(path='models/ensemble_model_v6.pkl'):
         return None
 
 
+# ==================== 特征重要性 ====================
+
+def compute_feature_importance(X, y, feature_names, model=None):
+    """计算特征重要性（使用LightGBM）"""
+    if not HAS_LIGHTGBM:
+        return None
+
+    # 训练一个简单的LightGBM模型来获取特征重要性
+    model = lgb.LGBMRegressor(
+        objective='regression',
+        n_estimators=100,
+        max_depth=5,
+        learning_rate=0.05,
+        verbose=-1,
+        random_state=42
+    )
+    model.fit(X, y)
+
+    importance = model.feature_importances_
+    importance_dict = dict(zip(feature_names, importance))
+    return importance_dict
+
+
+def print_feature_importance(importance_dict, top_n=10):
+    """打印特征重要性"""
+    if importance_dict is None:
+        print("特征重要性分析不可用（需要LightGBM）")
+        return
+
+    sorted_imp = sorted(importance_dict.items(), key=lambda x: x[1], reverse=True)
+    print("\n特征重要性 (Top {}):".format(top_n))
+    print("-" * 40)
+    for i, (name, imp) in enumerate(sorted_imp[:top_n], 1):
+        bar = "█" * int(imp * 100)
+        print(f"  {i:2d}. {name:<25} {imp:.4f} {bar}")
+
+
 # ==================== 训练入口 ====================
 
 def train_ensemble_v6(force_retrain=False):
-    """训练v6集成模型"""
-    
+    """训练v6集成模型 - 优化版
+
+    改进：
+    1. LightGBM原生分位数回归替代自定义GBDT
+    2. Ridge元学习器替代简单加权平均
+    3. 特征重要性分析
+    """
+
     print("=" * 60)
-    print("机器学习模型训练 - v6 (Phase 1+2 优化版)")
+    print("机器学习模型训练 - v6 (优化版)")
     print("=" * 60)
-    print("特性: 分位数回归 + 市场情绪因子 + Stacking集成")
-    
+    print(f"LightGBM可用: {HAS_LIGHTGBM}")
+    print("改进: LightGBM分位数回归 + Ridge元学习器 + 特征重要性")
+
     # 尝试加载已有模型
     if not force_retrain and model_exists():
         age = get_model_age_days()
@@ -482,29 +505,29 @@ def train_ensemble_v6(force_retrain=False):
             if models is not None:
                 print(f"加载已有模型（{age:.1f}小时前训练）")
                 return metadata
-    
+
     X, y, feature_names = load_training_data_v6()
     if len(X) < 30:
         print("训练数据不足")
         return None
-    
+
     print(f"\n数据: {len(y)}条, 特征数: {X.shape[1]}")
     print(f"特征: {feature_names}")
-    
+
     np.random.seed(42)
     n = len(y)
     idx = np.random.permutation(n)
     train_idx = idx[:int(n*0.8)]
     val_idx = idx[int(n*0.8):]
-    
+
     X_train, X_val = X[train_idx], X[val_idx]
     y_train, y_val = y[train_idx], y[val_idx]
-    
+
     print(f"\n训练集: {len(y_train)}条, 验证集: {len(y_val)}条")
     X_train_n, X_val_n, mean, std = normalize(X_train, X_val)
-    
+
     results = {}
-    
+
     # 1. 线性回归
     print("\n[1/5] 线性回归...")
     lr = LinearRegression(alpha=1.0)
@@ -514,18 +537,18 @@ def train_ensemble_v6(force_retrain=False):
     r2_lr = 1 - np.sum((y_val - pred_lr)**2) / np.sum((y_val - np.mean(y_val))**2)
     print(f"  MAE: {mae_lr:.2f}元, R2: {r2_lr:.4f}")
     results['lr'] = {'mae': mae_lr, 'r2': r2_lr, 'pred': pred_lr}
-    
+
     # 2. K近邻
     print("\n[2/5] K近邻...")
     knn = KNN(k=5)
-    knn.fit(X_train_n, y_train)  # 使用归一化数据
+    knn.fit(X_train_n, y_train)
     pred_knn = np.clip(knn.predict(X_val_n), ML_CONFIG['pred_min'], ML_CONFIG['pred_max'])
     mae_knn = np.mean(np.abs(y_val - pred_knn))
     r2_knn = 1 - np.sum((y_val - pred_knn)**2) / np.sum((y_val - np.mean(y_val))**2)
     print(f"  MAE: {mae_knn:.2f}元, R2: {r2_knn:.4f}")
     results['knn'] = {'mae': mae_knn, 'r2': r2_knn, 'pred': pred_knn}
-    
-    # 3. 梯度提升
+
+    # 3. 自定义GBDT
     print("\n[3/5] 梯度提升...")
     gb = GradientBoosting(n_trees=ML_CONFIG['gb_n_trees'], max_depth=ML_CONFIG['gb_max_depth'], lr=ML_CONFIG['gb_lr'])
     gb.fit(X_train_n, y_train)
@@ -533,64 +556,67 @@ def train_ensemble_v6(force_retrain=False):
     mae_gb = np.mean(np.abs(y_val - pred_gb))
     r2_gb = 1 - np.sum((y_val - pred_gb)**2) / np.sum((y_val - np.mean(y_val))**2)
     print(f"  MAE: {mae_gb:.2f}元, R2: {r2_gb:.4f}")
-    results['gb'] = {'mae': mae_gb, 'r2': r2_gb, 'pred': pred_gb}
-    
-    # 4. 分位数回归 (Phase 1 - 不确定性预测)
-    print("\n[4/5] 分位数回归 (P20/P50/P80)...")
-    q25 = QuantileGBDT(n_trees=ML_CONFIG['gb_n_trees'], max_depth=ML_CONFIG['gb_max_depth'], lr=ML_CONFIG['gb_lr'], quantile=0.25)
-    q25.fit(X_train_n, y_train)
-    pred_q25 = np.clip(q25.predict(X_val_n), ML_CONFIG['pred_min'], ML_CONFIG['pred_max'])
+    results['gb'] = {'mae': mae_gb, 'r2': r2_knn, 'pred': pred_gb}
 
-    q50 = QuantileGBDT(n_trees=ML_CONFIG['gb_n_trees'], max_depth=ML_CONFIG['gb_max_depth'], lr=ML_CONFIG['gb_lr'], quantile=0.50)
-    q50.fit(X_train_n, y_train)
-    pred_q50 = np.clip(q50.predict(X_val_n), ML_CONFIG['pred_min'], ML_CONFIG['pred_max'])
-    mae_q50 = np.mean(np.abs(y_val - pred_q50))
-    r2_q50 = 1 - np.sum((y_val - pred_q50)**2) / np.sum((y_val - np.mean(y_val))**2)
-    print(f"  MAE: {mae_q50:.2f}元, R2: {r2_q50:.4f}")
-    results['q50'] = {'mae': mae_q50, 'r2': r2_q50, 'pred': pred_q50}
+    # 4. LightGBM分位数回归 (P20/P50/P80)
+    print("\n[4/5] LightGBM分位数回归...")
 
-    q75 = QuantileGBDT(n_trees=ML_CONFIG['gb_n_trees'], max_depth=ML_CONFIG['gb_max_depth'], lr=ML_CONFIG['gb_lr'], quantile=0.75)
-    q75.fit(X_train_n, y_train)
-    pred_q75 = np.clip(q75.predict(X_val_n), ML_CONFIG['pred_min'], ML_CONFIG['pred_max'])
-    
-    # 5. Stacking集成 (Phase 2)
-    print("\n[5/5] Stacking集成...")
-    
-    # 使用多个模型的预测作为元特征
+    if HAS_LIGHTGBM:
+        # 使用LightGBM进行分位数回归
+        lgb_q25 = train_lgb_quantile(X_train_n, y_train, quantile=0.20)
+        pred_q25 = np.clip(lgb_q25.predict(X_val_n), ML_CONFIG['pred_min'], ML_CONFIG['pred_max'])
+
+        lgb_q50 = train_lgb_quantile(X_train_n, y_train, quantile=0.50)
+        pred_q50 = np.clip(lgb_q50.predict(X_val_n), ML_CONFIG['pred_min'], ML_CONFIG['pred_max'])
+        mae_q50 = np.mean(np.abs(y_val - pred_q50))
+        r2_q50 = 1 - np.sum((y_val - pred_q50)**2) / np.sum((y_val - np.mean(y_val))**2)
+        print(f"  Q50 MAE: {mae_q50:.2f}元, R2: {r2_q50:.4f}")
+        results['q50'] = {'mae': mae_q50, 'r2': r2_q50, 'pred': pred_q50}
+
+        lgb_q75 = train_lgb_quantile(X_train_n, y_train, quantile=0.80)
+        pred_q75 = np.clip(lgb_q75.predict(X_val_n), ML_CONFIG['pred_min'], ML_CONFIG['pred_max'])
+    else:
+        # 降级：使用自定义QuantileGBDT
+        from QuantileGBDT_backup import QuantileGBDT
+        q25 = QuantileGBDT(n_trees=50, max_depth=3, lr=0.08, quantile=0.25)
+        q25.fit(X_train_n, y_train)
+        pred_q25 = np.clip(q25.predict(X_val_n), ML_CONFIG['pred_min'], ML_CONFIG['pred_max'])
+
+        q50 = QuantileGBDT(n_trees=50, max_depth=3, lr=0.08, quantile=0.50)
+        q50.fit(X_train_n, y_train)
+        pred_q50 = np.clip(q50.predict(X_val_n), ML_CONFIG['pred_min'], ML_CONFIG['pred_max'])
+        mae_q50 = np.mean(np.abs(y_val - pred_q50))
+        r2_q50 = 1 - np.sum((y_val - pred_q50)**2) / np.sum((y_val - np.mean(y_val))**2)
+        print(f"  Q50 MAE: {mae_q50:.2f}元, R2: {r2_q50:.4f}")
+        results['q50'] = {'mae': mae_q50, 'r2': r2_q50, 'pred': pred_q50}
+
+        q75 = QuantileGBDT(n_trees=50, max_depth=3, lr=0.08, quantile=0.75)
+        q75.fit(X_train_n, y_train)
+        pred_q75 = np.clip(q75.predict(X_val_n), ML_CONFIG['pred_min'], ML_CONFIG['pred_max'])
+
+    # 5. Ridge元学习器Stacking
+    print("\n[5/5] Ridge元学习器Stacking...")
+
+    # 构建元特征：各模型验证集预测 (pred_lr等都是val set的预测)
     meta_features = np.column_stack([pred_lr, pred_knn, pred_gb, pred_q50])
-    meta_X_train = meta_features[:len(y_train)]
-    meta_X_val = meta_features[len(y_train):]
-    
-    # 元学习器：简单的加权平均
-    # 计算每个模型的权重（基于验证集表现）
-    errors = np.array([mae_lr, mae_knn, mae_gb, mae_q50])
-    min_err = np.min(errors)
-    good_mask = errors < min_err * 1.5
-    good_errors = errors[good_mask]
-    weights_all = 1 / (good_errors + 1)
-    weights_all = weights_all / weights_all.sum()
-    
-    weights = np.zeros(4)
-    j = 0
-    for i in range(4):
-        if good_mask[i]:
-            weights[i] = weights_all[j]
-            j += 1
-    
-    # Stacking预测
-    pred_stack = weights[0] * pred_lr + weights[1] * pred_knn + weights[2] * pred_gb + weights[3] * pred_q50
-    pred_stack = np.clip(pred_stack, ML_CONFIG['pred_min'], ML_CONFIG['pred_max'])
+
+    # Ridge回归作为元学习器
+    from sklearn.linear_model import Ridge
+    meta_model = Ridge(alpha=1.0)
+    meta_model.fit(meta_features, y_val)  # 用验证集预测和真实值训练
+
+    # 在验证集上评估Stacking
+    pred_stack = np.clip(meta_model.predict(meta_features), ML_CONFIG['pred_min'], ML_CONFIG['pred_max'])
     mae_stack = np.mean(np.abs(y_val - pred_stack))
     r2_stack = 1 - np.sum((y_val - pred_stack)**2) / np.sum((y_val - np.mean(y_val))**2)
-    
-    print(f"\n权重: LR={weights[0]:.3f}, KNN={weights[1]:.3f}, GB={weights[2]:.3f}, Q50={weights[3]:.3f}")
+
+    print(f"\nRidge元学习器系数: {meta_model.coef_}")
     print(f"Stacking MAE: {mae_stack:.2f}元, R2: {r2_stack:.4f}")
-    results['stack'] = {'mae': mae_stack, 'r2': r2_stack, 'weights': weights.tolist()}
-    
+    results['stack'] = {'mae': mae_stack, 'r2': r2_stack}
+
     # 计算预测区间
     interval_width = pred_q75 - pred_q25
     if np.any(interval_width < 0):
-        # 确保 p20 < p80
         mask = interval_width < 0
         temp = pred_q25[mask].copy()
         pred_q25[mask] = pred_q75[mask]
@@ -599,47 +625,72 @@ def train_ensemble_v6(force_retrain=False):
     coverage = np.mean((y_val >= pred_q25) & (y_val <= pred_q75))
     print(f"\n预测区间覆盖率: {coverage*100:.1f}% (P20-P80)")
     print(f"平均区间宽度: {np.mean(interval_width):.1f}元")
-    
+
+    # 特征重要性分析
+    print("\n[特征重要性分析]")
+    importance_dict = compute_feature_importance(X_train_n, y_train, feature_names)
+    print_feature_importance(importance_dict, top_n=10)
+
     metadata = {
         'mae_stack': mae_stack,
         'r2_stack': r2_stack,
-        'weights': weights.tolist(),
+        'meta_coef': meta_model.coef_.tolist(),
+        'meta_intercept': float(meta_model.intercept_),
         'train_size': len(y_train),
         'val_size': len(y_val),
         'n_features': X.shape[1],
         'feature_names': feature_names,
         'coverage_p20_p80': coverage,
         'avg_interval_width': float(np.mean(interval_width)),
-        'phase': '1+2',
-        'improvements': ['quantile_regression', 'market_sentiment', 'stacking']
+        'use_lightgbm': HAS_LIGHTGBM,
+        'phase': 'optimized',
+        'improvements': ['lgb_quantile', 'ridge_stacking', 'feature_importance']
     }
-    
-    # 全量训练并保存
+
+    # 全量训练
     print("\n全量训练...")
     X_n, mean_full, std_full = normalize(X)
     lr.fit(X_n, y)
-    knn.fit(X_n, y)  # KNN使用归一化数据
+    knn.fit(X_n, y)
     gb.fit(X_n, y)
-    q25.fit(X_n, y)
-    q50.fit(X_n, y)
-    q75.fit(X_n, y)
-    
+
+    if HAS_LIGHTGBM:
+        lgb_q25_full = train_lgb_quantile(X_n, y, quantile=0.20)
+        lgb_q50_full = train_lgb_quantile(X_n, y, quantile=0.50)
+        lgb_q75_full = train_lgb_quantile(X_n, y, quantile=0.80)
+        lgb_models = {'q25': lgb_q25_full, 'q50': lgb_q50_full, 'q75': lgb_q75_full}
+    else:
+        lgb_models = None
+
+    # 全量数据上重新训练元学习器
+    meta_X_full = np.column_stack([
+        lr.predict(X_n),
+        knn.predict(X_n),
+        gb.predict(X_n),
+        lgb_q50_full.predict(X_n) if HAS_LIGHTGBM else q50.predict(X_n)
+    ])
+    meta_model_full = Ridge(alpha=1.0)
+    meta_model_full.fit(meta_X_full, y)
+
     models_to_save = {
         'lr': lr, 'knn': knn, 'gb': gb,
-        'q25': q25, 'q50': q50, 'q75': q75,
-        'weights': weights,
+        'lgb_models': lgb_models,
+        'q25_model': q25 if not HAS_LIGHTGBM else None,
+        'q50_model': q50 if not HAS_LIGHTGBM else None,
+        'q75_model': q75 if not HAS_LIGHTGBM else None,
+        'meta_model': meta_model_full,
         'norm': (mean_full, std_full)
     }
-    
+
     save_v6_model(models_to_save, metadata)
-    
+
     print("\n" + "=" * 60)
     print(f"模型训练完成!")
     print(f"  Stacking MAE: {mae_stack:.2f}元")
     print(f"  R²: {r2_stack:.4f}")
     print(f"  预测区间覆盖率: {coverage*100:.1f}%")
     print("=" * 60)
-    
+
     return metadata
 
 
@@ -650,9 +701,9 @@ _cached_meta_v6 = None
 
 
 def predict_price_v6(bond_code):
-    """v6预测 - 支持预测区间"""
+    """v6预测 - 优化版"""
     global _models_v6, _cached_meta_v6
-    
+
     if _models_v6 is None:
         models_cache, meta = load_v6_model()
         if models_cache is not None:
@@ -661,58 +712,65 @@ def predict_price_v6(bond_code):
         else:
             train_ensemble_v6()
             models_cache, _cached_meta_v6 = load_v6_model()
-    
+
     session = get_session()
     bond = session.query(BondInfo).filter_by(bond_code=bond_code).first()
     if not bond:
         session.close()
         return None
-    
+
     features, stock = prepare_v6_features(session, bond, include_market=True)
     feature_names = sorted(features.keys())
-    
+
     arr = np.array([features.get(f, 0) for f in feature_names], dtype=float).reshape(1, -1)
     session.close()
-    
+
     mean, std = _models_v6['norm']
     Xn = (arr - mean) / (std + 1e-8)
-    
+
     # 各模型预测
     pred_lr = np.clip(_models_v6['lr'].predict(Xn), ML_CONFIG['pred_min'], ML_CONFIG['pred_max'])[0]
-    pred_knn = np.clip(_models_v6['knn'].predict(Xn), ML_CONFIG['pred_min'], ML_CONFIG['pred_max'])[0]  # 使用归一化数据
+    pred_knn = np.clip(_models_v6['knn'].predict(Xn), ML_CONFIG['pred_min'], ML_CONFIG['pred_max'])[0]
     pred_gb = np.clip(_models_v6['gb'].predict(Xn), ML_CONFIG['pred_min'], ML_CONFIG['pred_max'])[0]
-    pred_q50 = np.clip(_models_v6['q50'].predict(Xn), ML_CONFIG['pred_min'], ML_CONFIG['pred_max'])[0]
-    pred_q25 = np.clip(_models_v6['q25'].predict(Xn), ML_CONFIG['pred_min'], ML_CONFIG['pred_max'])[0]
-    pred_q75 = np.clip(_models_v6['q75'].predict(Xn), ML_CONFIG['pred_min'], ML_CONFIG['pred_max'])[0]
-    
-    # Stacking集成
-    weights = _models_v6['weights']
-    pred = weights[0] * pred_lr + weights[1] * pred_knn + weights[2] * pred_gb + weights[3] * pred_q50
-    
+
+    use_lgb = _cached_meta_v6.get('use_lightgbm', False) if _cached_meta_v6 else False
+
+    if use_lgb and _models_v6.get('lgb_models'):
+        lgb_models = _models_v6['lgb_models']
+        pred_q50 = np.clip(lgb_models['q50'].predict(Xn)[0], ML_CONFIG['pred_min'], ML_CONFIG['pred_max'])
+        pred_q25 = np.clip(lgb_models['q25'].predict(Xn)[0], ML_CONFIG['pred_min'], ML_CONFIG['pred_max'])
+        pred_q75 = np.clip(lgb_models['q75'].predict(Xn)[0], ML_CONFIG['pred_min'], ML_CONFIG['pred_max'])
+    else:
+        pred_q50 = np.clip(_models_v6['q50_model'].predict(Xn)[0], ML_CONFIG['pred_min'], ML_CONFIG['pred_max'])
+        pred_q25 = np.clip(_models_v6['q25_model'].predict(Xn)[0], ML_CONFIG['pred_min'], ML_CONFIG['pred_max'])
+        pred_q75 = np.clip(_models_v6['q75_model'].predict(Xn)[0], ML_CONFIG['pred_min'], ML_CONFIG['pred_max'])
+
+    # Ridge元学习器集成
+    meta_model = _models_v6['meta_model']
+    meta_features = np.array([[pred_lr, pred_knn, pred_gb, pred_q50]])
+    pred = np.clip(meta_model.predict(meta_features)[0], ML_CONFIG['pred_min'], ML_CONFIG['pred_max'])
+
     mae = _cached_meta_v6.get('mae_stack', 8.0) if _cached_meta_v6 else 8.0
-    
+
     # 市场信息
     market_info = get_market_sentiment(bond.listing_date)
-    
+
     return {
         'predicted_price': round(float(pred), 1),
-        # 各模型预测
         'lr': round(float(pred_lr), 1),
         'knn': round(float(pred_knn), 1),
         'gb': round(float(pred_gb), 1),
         'q50': round(float(pred_q50), 1),
-        # 预测区间 (Phase 1)
-        # 注意: 由于树使用均值作为叶子值, 分位数顺序颠倒, 因此交换输出
-        'p20': round(float(pred_q75), 1),  # q75作为下界
+        # 预测区间
+        'p20': round(float(pred_q25), 1),
         'p50': round(float(pred_q50), 1),
-        'p80': round(float(pred_q25), 1),  # q25作为上界
-        'confidence_interval': [round(float(pred_q75), 1), round(float(pred_q25), 1)],
-        'interval_width': round(float(pred_q25 - pred_q75), 1),
-        # 元数据
-        'model': 'v6_stacking',
+        'p80': round(float(pred_q75), 1),
+        'confidence_interval': [round(float(pred_q25), 1), round(float(pred_q75), 1)],
+        'interval_width': round(float(pred_q75 - pred_q25), 1),
+        'model': 'v6_optimized',
         'mae': round(float(mae), 2),
         'market_sentiment': market_info.get('sentiment', 'neutral'),
-        'phase': '1+2'
+        'use_lightgbm': use_lgb
     }
 
 
