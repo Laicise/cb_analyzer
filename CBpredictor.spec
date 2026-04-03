@@ -14,8 +14,7 @@ a = Analysis(
     ],
     hiddenimports=[
         'akshare', 'numpy', 'sqlalchemy', 'sqlite3',
-        'db.models', 'analysis.ml_model_v5', 'analysis.fundamental_features',
-        'analysis.model_persistence'
+        'db.models', 'analysis.ml_model_v6', 'analysis.fundamental_features',
     ],
     hookspath=[],
     hooksconfig={},

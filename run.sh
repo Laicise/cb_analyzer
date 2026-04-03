@@ -18,7 +18,7 @@ fi
 
 # 检查依赖
 echo "检查依赖..."
-python3 -c "import tkinter; from db.models import *; from analysis.ml_model_v5 import *; from analysis.model_persistence import *" 2>/dev/null
+python3 -c "import tkinter; from db.models import *; from analysis.ml_model_v6 import *" 2>/dev/null
 if [ $? -ne 0 ]; then
     echo "⚠️ 缺少依赖，正在安装..."
     pip3 install akshare numpy sqlalchemy --break-system-packages 2>/dev/null

@@ -18,8 +18,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 from db.models import get_session, BondInfo, StockInfo
-from analysis.ml_model_v6 import predict_price_v6
-from analysis.model_persistence import load_v6_model
+from analysis.ml_model_v6 import predict_price_v6, load_v6_model
 
 
 class CBPredictorApp:
