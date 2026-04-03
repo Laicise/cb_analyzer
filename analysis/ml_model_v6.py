@@ -29,13 +29,43 @@ except ImportError:
 
 # ==================== 市场情绪因子 ====================
 
-def get_market_sentiment(date):
-    """获取市场情绪因子"""
-    if date is None:
-        return {'market_score': 0.5, 'sentiment': 'neutral'}
+def get_market_sentiment(session, date):
+    """获取市场情绪因子
 
-    # 直接返回默认值，避免网络请求卡住
-    return {'market_score': 0.5, 'sentiment': 'neutral', 'change_pct': 0}
+    基于历史数据计算市场情绪：
+    - 查询前后3天内上市的可转债溢价率
+    - 计算市场整体情绪
+    """
+    if date is None:
+        return {'market_score': 0.5, 'sentiment': 'neutral', 'change_pct': 0, 'market_strength': 0}
+
+    try:
+        # 查询前后3天内的可转债首日表现
+        start_date = date - timedelta(days=3)
+        end_date = date + timedelta(days=3)
+
+        recent_bonds = session.query(BondInfo).filter(
+            BondInfo.listing_date >= start_date,
+            BondInfo.listing_date <= end_date,
+            BondInfo.first_open != None
+        ).all()
+
+        if len(recent_bonds) >= 3:
+            # 计算平均溢价率作为市场情绪指标
+            avg_premium = np.mean([b.premium_rate for b in recent_bonds if b.premium_rate])
+            # 溢价率高说明市场热情高
+            sentiment = min(1.0, max(0.0, avg_premium / 30))  # 归一化到0-1
+            change_pct = avg_premium - 20  # 相对于20%的基准
+            return {
+                'market_score': sentiment,
+                'sentiment': 'bullish' if sentiment > 0.6 else 'bearish' if sentiment < 0.4 else 'neutral',
+                'change_pct': change_pct,
+                'market_strength': len(recent_bonds)
+            }
+    except:
+        pass
+
+    return {'market_score': 0.5, 'sentiment': 'neutral', 'change_pct': 0, 'market_strength': 0}
 
 
 def get_batch_info(session, listing_date):
@@ -145,6 +175,29 @@ def prepare_v6_features(session, bond, include_market=True):
     else:
         features['size_tier'] = 3  # 大盘
 
+    # === 新增特征 ===
+
+    # 1. 纯债价值 (pure bond value)
+    # 基于票息和面值估算，假设贴现率5%
+    par_value = bond.par_value or 100
+    coupon = features['coupon_rate']
+    years = features['years_to_expiry']
+    # 简化的纯债价值计算：各年票息贴现之和 + 面值贴现
+    pure_value = 0
+    for y in range(1, int(years) + 1):
+        pure_value += coupon * par_value / ((1 + 0.05) ** y)
+    pure_value += par_value / ((1 + 0.05) ** years)
+    features['pure_bond_value'] = pure_value
+
+    # 2. 转股价值/发行规模比 (cv to size ratio)
+    features['cv_size_ratio'] = features['conversion_value'] / (issue_size + 0.1)
+
+    # 3. 小盘债标志 (容易炒作)
+    features['is_small_issue'] = 1.0 if issue_size < 5 else 0.0
+
+    # 4. 纯债价值/发行规模比 (债底相对规模)
+    features['pbv_size_ratio'] = features['pure_bond_value'] / (issue_size + 0.1)
+
     # === 正股基本面特征 ===
     stock = None
     if bond.stock_code:
@@ -186,7 +239,7 @@ def prepare_v6_features(session, bond, include_market=True):
         listing_date = bond.listing_date or datetime.now()
 
         # 大盘情绪
-        market_info = get_market_sentiment(listing_date)
+        market_info = get_market_sentiment(session, listing_date)
         features['market_score'] = market_info.get('market_score', 0.5)
         features['market_change'] = market_info.get('change_pct', 0)
 
@@ -723,6 +776,9 @@ def predict_price_v6(bond_code):
     feature_names = sorted(features.keys())
 
     arr = np.array([features.get(f, 0) for f in feature_names], dtype=float).reshape(1, -1)
+
+    # 市场信息（在关闭session前获取）
+    market_info = get_market_sentiment(session, bond.listing_date)
     session.close()
 
     mean, std = _models_v6['norm']
@@ -751,9 +807,6 @@ def predict_price_v6(bond_code):
     pred = np.clip(meta_model.predict(meta_features)[0], ML_CONFIG['pred_min'], ML_CONFIG['pred_max'])
 
     mae = _cached_meta_v6.get('mae_stack', 8.0) if _cached_meta_v6 else 8.0
-
-    # 市场信息
-    market_info = get_market_sentiment(bond.listing_date)
 
     return {
         'predicted_price': round(float(pred), 1),
