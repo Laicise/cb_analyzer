@@ -827,6 +827,132 @@ def predict_price_v6(bond_code):
     }
 
 
+def evaluate_on_history_v6():
+    """在历史数据上评估v6模型（滚动训练）"""
+    session = get_session()
+
+    # 加载所有有首日数据的债券
+    bonds = session.query(BondInfo).filter(
+        BondInfo.first_open != None,
+        BondInfo.conversion_value != None
+    ).order_by(BondInfo.listing_date).all()
+
+    if len(bonds) < 30:
+        print("数据不足，无法回测")
+        session.close()
+        return None
+
+    errors = []
+    predictions = []
+
+    print(f"\n开始滚动回测，共 {len(bonds)} 个样本...")
+
+    for i in range(10, len(bonds)):
+        bond = bonds[i]
+
+        # 使用之前的样本训练
+        train_bonds = bonds[:i]
+        if len(train_bonds) < 30:
+            continue
+
+        # 构建训练数据
+        X_train_list = []
+        y_train_list = []
+        feature_names = None
+
+        for b in train_bonds:
+            feat, _ = prepare_v6_features(session, b, include_market=True)
+            if feat and len(feat) >= 20:
+                if feature_names is None:
+                    feature_names = sorted(feat.keys())
+                arr = np.array([feat.get(f, 0) for f in feature_names], dtype=float)
+                X_train_list.append(arr)
+                y_train_list.append(b.first_open)
+
+        if len(X_train_list) < 30:
+            continue
+
+        X_train = np.array(X_train_list)
+        y_train = np.array(y_train_list)
+
+        try:
+            # 训练简单模型
+            mean_t = np.mean(X_train, axis=0)
+            std_t = np.std(X_train, axis=0) + 1e-8
+            Xn_t = (X_train - mean_t) / std_t
+
+            # 使用sklearn的GradientBoostingRegressor
+            from sklearn.ensemble import GradientBoostingRegressor
+            from sklearn.linear_model import Ridge
+
+            lr = Ridge(alpha=1.0)
+            lr.fit(Xn_t, y_train)
+
+            gb = GradientBoostingRegressor(n_estimators=100, max_depth=4, random_state=42)
+            gb.fit(X_train, y_train)
+
+            # 预测当前
+            feat_test, _ = prepare_v6_features(session, bond, include_market=True)
+            if not feat_test or len(feat_test) < 20:
+                continue
+
+            X_test = np.array([[feat_test.get(f, 0) for f in feature_names]])
+            Xn_test = (X_test - mean_t) / std_t
+
+            pred_lr = np.clip(lr.predict(Xn_test)[0], ML_CONFIG['pred_min'], ML_CONFIG['pred_max'])
+            pred_gb = np.clip(gb.predict(X_test)[0], ML_CONFIG['pred_min'], ML_CONFIG['pred_max'])
+
+            # 简单集成
+            pred = 0.6 * pred_lr + 0.4 * pred_gb
+            actual = bond.first_open
+            error = abs(pred - actual)
+            error_pct = error / actual * 100
+            errors.append(error_pct)
+
+            predictions.append({
+                'bond_code': bond.bond_code,
+                'predicted': round(pred, 2),
+                'actual': round(actual, 2),
+                'error_pct': round(error_pct, 2)
+            })
+        except Exception as e:
+            continue
+
+    session.close()
+
+    if not errors:
+        print("回测失败")
+        return None
+
+    print("\n" + "=" * 60)
+    print("v6模型历史回测结果")
+    print("=" * 60)
+    print(f"总预测数: {len(errors)}")
+    print(f"平均误差: {np.mean(errors):.2f}%")
+    print(f"误差中位数: {np.median(errors):.2f}%")
+
+    excellent = sum(1 for e in errors if e <= 5)
+    good = sum(1 for e in errors if 5 < e <= 10)
+    fair = sum(1 for e in errors if 10 < e <= 15)
+    poor = sum(1 for e in errors if e > 15)
+
+    print(f"优秀(≤5%): {excellent} ({excellent/len(errors)*100:.0f}%)")
+    print(f"良好(5-10%): {good} ({good/len(errors)*100:.0f}%)")
+    print(f"一般(10-15%): {fair} ({fair/len(errors)*100:.0f}%)")
+    print(f"较差(>15%): {poor} ({poor/len(errors)*100:.0f}%)")
+    print("=" * 60)
+
+    return {
+        'mean_error': np.mean(errors),
+        'median_error': np.median(errors),
+        'excellent': excellent,
+        'good': good,
+        'fair': fair,
+        'poor': poor,
+        'total': len(errors)
+    }
+
+
 if __name__ == '__main__':
     import sys
     if len(sys.argv) > 1 and sys.argv[1] == 'force':

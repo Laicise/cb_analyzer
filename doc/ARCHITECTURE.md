@@ -70,9 +70,9 @@
 
 | 算法 | 文件 | 说明 |
 |------|------|------|
-| 相似度匹配 | `similarity*.py` | 基于正股基本面的历史相似债券匹配 |
-| ML集成模型 | `ml_model_v5.py` | 线性回归 + K近邻 + 梯度提升集成 |
-| 特征工程 | `fundamental_features.py` | 17维特征：PE、PB、ROE、市值、行业等 |
+| 相似度匹配 | `similarity.py` | 基于ML学习权重的历史相似债券匹配 |
+| ML集成模型v6 | `ml_model_v6.py` | LightGBM分位数回归 + Ridge Stacking |
+| 特征工程 | 内置 | 28维特征：PE、PB、ROE、市值、行业、市场情绪等 |
 
 ### 3.3 数据模型
 

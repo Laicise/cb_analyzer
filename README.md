@@ -4,10 +4,11 @@
 
 ## 功能特点
 
-- 🤖 ML模型v5预测（线性回归 + K近邻 + 梯度提升集成）
-- 📊 24维特征工程（正股基本面、市场情绪、溢价率等）
-- 🎯 预测精度MAE=7.55元（回测样本356条）
+- 🤖 ML模型v6预测（LightGBM分位数回归 + Ridge元学习器Stacking）
+- 📊 28维特征工程（正股基本面、市场情绪、批次效应、规模溢价等）
+- 🎯 预测精度MAE=5.24元（验证集），回测误差≤10元占比91%
 - 💾 模型持久化（启动即用，无需重训练）
+- ⚡ 相似度+ML双策略智能组合
 
 ## 安装运行
 
@@ -66,14 +67,14 @@ cb_analyzer/
 ├── db/
 │   └── models.py       # 数据库模型
 ├── analysis/
-│   ├── ml_model_v5.py  # ML模型v5
-│   ├── fundamental_features.py  # 特征工程
-│   └── model_persistence.py     # 模型持久化
+│   ├── ml_model_v6.py  # ML模型v6（LightGBM + Stacking）
+│   ├── similarity.py    # 相似度匹配（ML优化权重）
+│   └── model_persistence.py  # 模型持久化
 ├── scripts/
 │   ├── fetch_real_pe_pb.py     # 获取PE/PB数据
 │   └── fetch_stock_fundamentals.py
 ├── models/
-│   ├── ensemble_model.pkl      # 训练好的模型
+│   ├── ensemble_model_v6.pkl    # 训练好的v6模型
 │   └── model_config.json       # 模型配置
 └── data/
     └── cb_analyzer.db          # SQLite数据库
@@ -83,16 +84,23 @@ cb_analyzer/
 
 | 指标 | 数值 |
 |------|------|
-| 验证集MAE | 7.55元 |
-| 验证集R² | 0.248 |
-| 回测样本 | 356条 |
-| 误差<8元占比 | 76.2% |
+| Stacking MAE | 5.24元 |
+| R² | 0.3145 |
+| 预测区间覆盖率 | 47.2% (P20-P80) |
+| 回测误差≤5% | 69.1% |
+| 回测误差≤10% | 91.0% |
+
+### v6改进
+- LightGBM分位数回归替代sklearn GBDT
+- Ridge元学习器替代简单平均
+- 市场情绪因子（基于历史批次数据）
+- 28维特征（新增纯债价值、转股/规模比等）
 
 ## 数据来源
 
 - 可转债数据：[AKShare](https://akshare.akfamily.xyz/)
 - PE/PB数据：东方财富实时行情
-- 训练样本：360条历史可转债
+- 训练样本：356条历史可转债
 
 ## 技术栈
 
@@ -101,6 +109,8 @@ cb_analyzer/
 - NumPy（数值计算）
 - SQLAlchemy（数据库）
 - AKShare（金融数据）
+- LightGBM（分位数回归）
+- scikit-learn（Ridge回归、Stacking）
 
 ## License
 

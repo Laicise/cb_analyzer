@@ -14,7 +14,7 @@ from scripts.fetch_stock_fundamentals import fetch_all_stock_fundamentals, updat
 from scripts.calculate_yield import update_yields
 from scripts.continue_fetch import continue_fetch_history
 from analysis.similarity import find_similar_bonds, get_confidence_level, predict_price_similarity
-from analysis.ml_model_v6 import train_ensemble_v6, predict_price_v6
+from analysis.ml_model_v6 import train_ensemble_v6, predict_price_v6, evaluate_on_history_v6
 from config import RATING_MAP
 from datetime import datetime
 import warnings
@@ -330,8 +330,8 @@ def backtest(model='v6'):
     print("\n" + "="*60)
     print(f"开始历史回测 ({model})...")
     print("="*60)
-    
-    evaluate_on_history()
+
+    evaluate_on_history_v6()
 
 
 def stats():
