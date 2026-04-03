@@ -13,7 +13,7 @@ from scripts.fetch_stock_info import fetch_all_stock_info
 from scripts.fetch_stock_fundamentals import fetch_all_stock_fundamentals, update_missing_stock_info
 from scripts.calculate_yield import update_yields
 from scripts.continue_fetch import continue_fetch_history
-from analysis.similarity import find_similar_bonds, get_confidence_level
+from analysis.similarity import find_similar_bonds, get_confidence_level, predict_price_similarity
 from analysis.ml_model_v6 import train_ensemble_v6, predict_price_v6
 from config import RATING_MAP
 from datetime import datetime
@@ -81,6 +81,80 @@ def show_bonds(limit=10):
         session.close()
 
 
+def combine_predictions(ml_result, sim_result):
+    """智能组合ML和相似度预测
+
+    策略：
+    1. ML模型MAE显著更低，给更高基础权重 (ML: ~5.5, Sim: ~10.2)
+    2. 相似度置信度极高(>0.7)时适当参考
+    3. 差异大时以ML为主
+    """
+    if ml_result is None and sim_result is None:
+        return None
+
+    if ml_result is None:
+        return sim_result
+
+    if sim_result is None:
+        return ml_result
+
+    # 基础权重：ML性能显著更好，给极高权重
+    # ML MAE ≈ 5.5, Sim MAE ≈ 10.2
+    w_ml_base = 0.90  # 默认给ML 90%权重
+    w_sim_base = 0.10
+
+    # 计算组合预测
+    ml_price = ml_result['predicted_price']
+    sim_price = sim_result['predicted_price']
+
+    # 预测差异检查
+    diff_pct = abs(ml_price - sim_price) / ((ml_price + sim_price) / 2)
+    sim_conf = sim_result.get('avg_confidence', 0.5)
+
+    # 仅在以下条件都满足时提高相似度权重：
+    # 1. 相似度置信度极高 (>0.7)
+    # 2. 两者预测差异小 (<10%)
+    if sim_conf >= 0.70 and diff_pct < 0.10:
+        w_ml = 0.85
+        w_sim = 0.15
+    elif diff_pct > 0.15:  # 差异大时，大幅提高ML权重
+        w_ml = 0.95
+        w_sim = 0.05
+
+    combined_price = ml_price * w_ml + sim_price * w_sim
+
+    # 计算置信度
+    base_confidence = w_ml * (1 / ml_result.get('mae', 8)) + w_sim * sim_conf
+    confidence_score = min(1.0, base_confidence * 5)
+
+    # 判断等级
+    if confidence_score >= 0.7:
+        level = 'A'
+        desc = '高置信度'
+    elif confidence_score >= 0.5:
+        level = 'B'
+        desc = '中等置信度'
+    elif confidence_score >= 0.3:
+        level = 'C'
+        desc = '较低置信度'
+    else:
+        level = 'D'
+        desc = '低置信度'
+
+    return {
+        'predicted_price': round(combined_price, 2),
+        'ml_price': ml_price,
+        'sim_price': sim_price,
+        'ml_weight': round(w_ml, 2),
+        'sim_weight': round(w_sim, 2),
+        'confidence_level': level,
+        'confidence_desc': desc,
+        'confidence_score': round(confidence_score, 2),
+        'disagreement': diff_pct > 0.10,
+        'method': 'combined'
+    }
+
+
 def predict_bond(bond_code, method='all', model='v6'):
     """预测债券价格"""
     print("\n" + "="*70)
@@ -93,127 +167,142 @@ def predict_bond(bond_code, method='all', model='v6'):
 
         if not bond:
             print(f"未找到债券 {bond_code}")
+            session.close()
             return
-    
-    stock = session.query(StockInfo).filter_by(stock_code=bond.stock_code).first()
-    
-    print(f"\n【目标债券信息】")
-    print(f"  债券名称: {bond.bond_name}")
-    print(f"  正股名称: {bond.stock_name}")
-    print(f"  所属行业: {stock.industry_sw_l1 if stock and stock.industry_sw_l1 else '未知'}")
-    print(f"  信用评级: {bond.credit_rating or '未知'}")
-    print(f"  转股价: {bond.conversion_price}元")
-    print(f"  转股价值: {bond.conversion_value}元")
-    print(f"  转股溢价率: {bond.premium_rate}%")
-    print(f"  发行规模: {bond.issue_size}亿元")
-    
-    if bond.first_open:
-        print(f"\n  ★ 实际首日开盘价: {bond.first_open}元")
-    
-    results = {}
-    
-    # 1. 相似度匹配预测
-    if method in ['all', 'similarity']:
-        print(f"\n{'='*70}")
-        print(f"【方法1: 相似度匹配】")
-        print(f"{'='*70}")
-        
-        similar = find_similar_bonds(bond_code, top_n=5)
-        if similar:
-            print(f"找到 {len(similar)} 个相似债券:")
-            total_sim = 0
-            weighted_price = 0
-            for i, s in enumerate(similar, 1):
-                if s['current_price']:
-                    print(f"  {i}. {s['bond_name']} 相似度={s['similarity']:.1%} 现价={s['current_price']:.2f}")
-                    total_sim += s['similarity']
-                    weighted_price += s['first_open'] * s['similarity'] if s.get('first_open') else s['current_price'] * s['similarity']
-            
-            if total_sim > 0:
-                sim_pred = weighted_price / total_sim
-                results['similarity'] = round(sim_pred, 2)
-                print(f"\n  相似度匹配预测: {results['similarity']}元")
-        else:
-            print("未找到相似债券")
-    
-    # 2. ML模型预测
-    if method in ['all', 'ml', 'mlv6']:
-        if model == 'v6':
-            print(f"\n{'='*70}")
-            print(f"【方法2: 机器学习模型 v6 (Phase 1+2优化)】")
-            print(f"{'='*70}")
-            
-            ml_result = predict_price_v6(bond_code)
-            if ml_result:
-                results['ml'] = ml_result['predicted_price']
-                print(f"  预测价格: {ml_result['predicted_price']}元")
-                print(f"  ├─ 线性回归: {ml_result.get('lr', 'N/A')}元")
-                print(f"  ├─ K近邻: {ml_result.get('knn', 'N/A')}元")
-                print(f"  ├─ 梯度提升: {ml_result.get('gb', 'N/A')}元")
-                print(f"  └─ 分位数回归: {ml_result.get('q50', 'N/A')}元")
-                print(f"  ─────────────────────────")
-                print(f"  预测区间: [{ml_result.get('p20', 'N/A')}, {ml_result.get('p80', 'N/A')}]元")
-                print(f"  区间宽度: {ml_result.get('interval_width', 'N/A')}元")
-                print(f"  市场情绪: {ml_result.get('market_sentiment', 'N/A')}")
-                print(f"  模型MAE: {ml_result['mae']:.2f}元")
-            else:
-                print("ML模型v6不可用（数据不足）")
 
-    # 综合预测
-    if len(results) > 1:
-        print(f"\n{'='*70}")
-        print(f"【综合预测】")
-        print(f"{'='*70}")
-        
-        avg_price = sum(results.values()) / len(results)
-        print(f"  相似度匹配: {results.get('similarity', 'N/A')}元")
-        print(f"  机器学习: {results.get('ml', 'N/A')}元")
-        print(f"  ─────────────────────────")
-        print(f"  综合预测: {round(avg_price, 2)}元")
-        
-        # 保存预测
-        record = PredictionRecord(
-            bond_code=bond_code,
-            bond_name=bond.bond_name,
-            predict_date=datetime.now(),
-            predicted_price=round(avg_price, 2),
-            confidence_level='B',
-            reference_bonds=str(list(results.keys())),
-            status='pending'
-        )
+        stock = session.query(StockInfo).filter_by(stock_code=bond.stock_code).first()
+
+        print(f"\n【目标债券信息】")
+        print(f"  债券名称: {bond.bond_name}")
+        print(f"  正股名称: {bond.stock_name}")
+        print(f"  所属行业: {stock.industry_sw_l1 if stock and stock.industry_sw_l1 else '未知'}")
+        print(f"  信用评级: {bond.credit_rating or '未知'}")
+        print(f"  转股价: {bond.conversion_price}元")
+        print(f"  转股价值: {bond.conversion_value}元")
+        print(f"  转股溢价率: {bond.premium_rate}%")
+        print(f"  发行规模: {bond.issue_size}亿元")
+
         if bond.first_open:
-            error = abs(avg_price - bond.first_open) / bond.first_open * 100
-            record.actual_price = bond.first_open
-            record.error_rate = error
-            record.status = 'confirmed'
-        
-        session.add(record)
-        bond.predicted_price = avg_price
-        session.commit()
-        print(f"\n  (预测已保存)")
-    elif len(results) == 1:
-        final_price = list(results.values())[0]
-        print(f"\n最终预测: {final_price}元")
-        
-        record = PredictionRecord(
-            bond_code=bond_code,
-            bond_name=bond.bond_name,
-            predict_date=datetime.now(),
-            predicted_price=final_price,
-            confidence_level='C',
-            status='pending'
-        )
-        if bond.first_open:
-            record.actual_price = bond.first_open
-            record.error_rate = abs(final_price - bond.first_open) / bond.first_open * 100
-            record.status = 'confirmed'
-        
-        session.add(record)
-        bond.predicted_price = final_price
-        session.commit()
-    
-    if bond.first_open and results:
-        print(f"\n★ 对比实际: {bond.first_open}元, 误差: {abs(round(avg_price,2) - bond.first_open):.2f}元 ({abs(round(avg_price,2) - bond.first_open)/bond.first_open*100:.1f}%)")
+            print(f"\n  ★ 实际首日开盘价: {bond.first_open}元")
+
+        results = {}
+
+        # 1. 相似度匹配预测
+        if method in ['all', 'similarity']:
+            print(f"\n{'='*70}")
+            print(f"【方法1: 相似度匹配】")
+            print(f"{'='*70}")
+
+            similar = find_similar_bonds(bond_code, top_n=5)
+            if similar:
+                print(f"找到 {len(similar)} 个相似债券:")
+                total_sim = 0
+                weighted_price = 0
+                for i, s in enumerate(similar, 1):
+                    if s['current_price']:
+                        print(f"  {i}. {s['bond_name']} 相似度={s['similarity']:.1%} 现价={s['current_price']:.2f}")
+                        total_sim += s['similarity']
+                        weighted_price += s['first_open'] * s['similarity'] if s.get('first_open') else s['current_price'] * s['similarity']
+
+                if total_sim > 0:
+                    sim_pred = weighted_price / total_sim
+                    results['similarity'] = round(sim_pred, 2)
+                    print(f"\n  相似度匹配预测: {results['similarity']}元")
+            else:
+                print("未找到相似债券")
+
+        # 2. ML模型预测
+        ml_result_full = None
+        if method in ['all', 'ml', 'mlv6']:
+            if model == 'v6':
+                print(f"\n{'='*70}")
+                print(f"【方法2: 机器学习模型 v6 (Phase 1+2优化)】")
+                print(f"{'='*70}")
+
+                ml_result_full = predict_price_v6(bond_code)
+                if ml_result_full:
+                    results['ml'] = ml_result_full['predicted_price']
+                    print(f"  预测价格: {ml_result_full['predicted_price']}元")
+                    print(f"  ├─ 线性回归: {ml_result_full.get('lr', 'N/A')}元")
+                    print(f"  ├─ K近邻: {ml_result_full.get('knn', 'N/A')}元")
+                    print(f"  ├─ 梯度提升: {ml_result_full.get('gb', 'N/A')}元")
+                    print(f"  └─ 分位数回归: {ml_result_full.get('q50', 'N/A')}元")
+                    print(f"  ─────────────────────────")
+                    print(f"  预测区间: [{ml_result_full.get('p20', 'N/A')}, {ml_result_full.get('p80', 'N/A')}]元")
+                    print(f"  区间宽度: {ml_result_full.get('interval_width', 'N/A')}元")
+                    print(f"  市场情绪: {ml_result_full.get('market_sentiment', 'N/A')}")
+                    print(f"  模型MAE: {ml_result_full['mae']:.2f}元")
+                else:
+                    print("ML模型v6不可用（数据不足）")
+
+        # 综合预测（智能组合）
+        if len(results) > 1:
+            print(f"\n{'='*70}")
+            print(f"【综合预测 - 智能加权组合】")
+            print(f"{'='*70}")
+
+            # 获取相似度预测结果
+            sim_result_full = None
+            if 'similarity' in results:
+                sim_result_full = predict_price_similarity(bond_code)
+
+            # 智能组合
+            combined = combine_predictions(ml_result_full, sim_result_full)
+
+            if combined:
+                print(f"  相似度预测: {combined.get('sim_price', 'N/A')}元 (权重: {combined.get('sim_weight', 'N/A')})")
+                print(f"  ML模型预测: {combined.get('ml_price', 'N/A')}元 (权重: {combined.get('ml_weight', 'N/A')})")
+                if combined.get('disagreement'):
+                    print(f"  ⚠️ 两者差异较大 ({abs(combined.get('ml_price', 0) - combined.get('sim_price', 0)):.1f}元)")
+                print(f"  ─────────────────────────")
+                print(f"  综合预测: {combined['predicted_price']}元")
+                print(f"  置信度: [{combined['confidence_level']}] {combined['confidence_desc']} ({combined['confidence_score']:.0%})")
+
+            avg_price = combined['predicted_price'] if combined else sum(results.values()) / len(results)
+
+            # 保存预测
+            record = PredictionRecord(
+                bond_code=bond_code,
+                bond_name=bond.bond_name,
+                predict_date=datetime.now(),
+                predicted_price=round(avg_price, 2),
+                confidence_level=combined['confidence_level'] if combined else 'B',
+                reference_bonds=f"ML:{combined.get('ml_weight','N/A')}/Sim:{combined.get('sim_weight','N/A')}" if combined else str(list(results.keys())),
+                status='pending'
+            )
+            if bond.first_open:
+                error = abs(avg_price - bond.first_open) / bond.first_open * 100
+                record.actual_price = bond.first_open
+                record.error_rate = error
+                record.status = 'confirmed'
+
+            session.add(record)
+            bond.predicted_price = avg_price
+            session.commit()
+            print(f"\n  (预测已保存)")
+        elif len(results) == 1:
+            final_price = list(results.values())[0]
+            print(f"\n最终预测: {final_price}元")
+
+            record = PredictionRecord(
+                bond_code=bond_code,
+                bond_name=bond.bond_name,
+                predict_date=datetime.now(),
+                predicted_price=final_price,
+                confidence_level='C',
+                status='pending'
+            )
+            if bond.first_open:
+                record.actual_price = bond.first_open
+                record.error_rate = abs(final_price - bond.first_open) / bond.first_open * 100
+                record.status = 'confirmed'
+
+            session.add(record)
+            bond.predicted_price = final_price
+            session.commit()
+
+        if bond.first_open and results:
+            print(f"\n★ 对比实际: {bond.first_open}元, 误差: {abs(round(avg_price,2) - bond.first_open):.2f}元 ({abs(round(avg_price,2) - bond.first_open)/bond.first_open*100:.1f}%)")
     finally:
         session.close()
 
